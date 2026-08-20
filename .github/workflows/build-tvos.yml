@@ -166,22 +166,18 @@ jobs:
           path = Path("tvos/Runner.xcodeproj/project.pbxproj")
           text = path.read_text()
 
-          marker = '97C147041CF9000082B41691 /* Release */ = {'
-          start = text.index(marker)
-          end = text.index('\n\t\t};', start)
-
-          block = text[start:end]
-
           old = '"CODE_SIGN_IDENTITY[sdk=appletvos*]" = "Apple Development";'
           new = '"CODE_SIGN_IDENTITY[sdk=appletvos*]" = "Apple Distribution";'
 
-          if old not in block:
-              raise SystemExit("Release signing identity not found")
+          count = text.count(old)
 
-          block = block.replace(old, new, 1)
-          path.write_text(text[:start] + block + text[end:])
+          if count == 0:
+              raise SystemExit("No tvOS Apple Development signing identities found")
 
-          print("Runner project Release signing set to Apple Distribution")
+          text = text.replace(old, new)
+          path.write_text(text)
+
+          print(f"Changed {count} tvOS signing identities to Apple Distribution")
           PY
 
       - name: Archive for App Store (TestFlight)
