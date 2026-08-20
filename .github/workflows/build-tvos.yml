@@ -157,29 +157,6 @@ jobs:
           path: ${{ runner.temp }}/moonfin.ipa
           if-no-files-found: error
 
-      - name: Configure Runner for TestFlight signing
-        if: ${{ inputs.distribution == 'testflight' }}
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("tvos/Runner.xcodeproj/project.pbxproj")
-          text = path.read_text()
-
-          old = '"CODE_SIGN_IDENTITY[sdk=appletvos*]" = "Apple Development";'
-          new = '"CODE_SIGN_IDENTITY[sdk=appletvos*]" = "Apple Distribution";'
-
-          count = text.count(old)
-
-          if count == 0:
-              raise SystemExit("No tvOS Apple Development signing identities found")
-
-          text = text.replace(old, new)
-          path.write_text(text)
-
-          print(f"Changed {count} tvOS signing identities to Apple Distribution")
-          PY
-
       - name: Archive for App Store (TestFlight)
         if: ${{ inputs.distribution == 'testflight' }}
         run: |
@@ -196,6 +173,8 @@ jobs:
             -authenticationKeyID "${{ secrets.APPLE_ASC_API_KEY_ID }}" \
             -authenticationKeyIssuerID "${{ secrets.APPLE_ASC_API_ISSUER_ID }}" \
             CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY=- \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             archive
