@@ -174,6 +174,7 @@ jobs:
             -authenticationKeyIssuerID "${{ secrets.APPLE_ASC_API_ISSUER_ID }}" \
             CODE_SIGNING_ALLOWED=YES \
             CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             archive
           APPEX="$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app/PlugIns/MoonfinTopShelf.appex/MoonfinTopShelf"
