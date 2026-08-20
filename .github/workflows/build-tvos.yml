@@ -157,6 +157,33 @@ jobs:
           path: ${{ runner.temp }}/moonfin.ipa
           if-no-files-found: error
 
+      - name: Configure Runner for TestFlight signing
+        if: ${{ inputs.distribution == 'testflight' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tvos/Runner.xcodeproj/project.pbxproj")
+          text = path.read_text()
+
+          marker = '97C147041CF9000082B41691 /* Release */ = {'
+          start = text.index(marker)
+          end = text.index('\n\t\t};', start)
+
+          block = text[start:end]
+
+          old = '"CODE_SIGN_IDENTITY[sdk=appletvos*]" = "Apple Development";'
+          new = '"CODE_SIGN_IDENTITY[sdk=appletvos*]" = "Apple Distribution";'
+
+          if old not in block:
+              raise SystemExit("Release signing identity not found")
+
+          block = block.replace(old, new, 1)
+          path.write_text(text[:start] + block + text[end:])
+
+          print("Runner project Release signing set to Apple Distribution")
+          PY
+
       - name: Archive for App Store (TestFlight)
         if: ${{ inputs.distribution == 'testflight' }}
         run: |
@@ -174,7 +201,6 @@ jobs:
             -authenticationKeyIssuerID "${{ secrets.APPLE_ASC_API_ISSUER_ID }}" \
             CODE_SIGNING_ALLOWED=YES \
             CODE_SIGN_STYLE=Automatic \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             archive
           APPEX="$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app/PlugIns/MoonfinTopShelf.appex/MoonfinTopShelf"
