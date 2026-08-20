@@ -343,7 +343,8 @@ class _MediaBarState extends State<MediaBar>
     return mounted &&
         !widget.externallyPaused &&
         _isHomeRouteCurrent() &&
-        !_mainPlaybackActive;
+        !_mainPlaybackActive &&
+        !PlayerRouteObserver.instance.isPlayerActive.value;
   }
 
   bool _useMedia3TrailerEngine() {
