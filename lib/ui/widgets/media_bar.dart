@@ -320,10 +320,16 @@ class _MediaBarState extends State<MediaBar>
     super.dispose();
   }
 
-  // Re-evaluate the persistent Media3 view's mount condition when a player
-  // route is pushed or popped.
+  // Re-evaluate the persistent Media3 view's mount condition, and stop any
+  // trailer the new route now covers. Main playback already cancels through
+  // the audio arbiter, but a player route with no audio of its own, like the
+  // photo viewer, does not.
   void _onPlayerRouteChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    if (PlayerRouteObserver.instance.isPlayerActive.value) {
+      _cancelTrailerPreview(rebuild: false);
+    }
+    setState(() {});
   }
 
   bool _isHomePath(String path) {
@@ -339,12 +345,17 @@ class _MediaBarState extends State<MediaBar>
   /// Whether a trailer may play right now. Re-checked after every await in the
   /// reveal pipeline so a leave-event aborts the reveal even before
   /// _cancelTrailerPreview() runs.
+  ///
+  /// The player route check stays separate from _isHomeRouteCurrent because a
+  /// pushed route leaves the router's reported uri on the home path, so that
+  /// check still reads as current while a player sits on top. Pausing then
+  /// clears _mainPlaybackActive and a trailer would start behind the player.
   bool _trailerShouldBeActive() {
     return mounted &&
         !widget.externallyPaused &&
+        !PlayerRouteObserver.instance.isPlayerActive.value &&
         _isHomeRouteCurrent() &&
-        !_mainPlaybackActive &&
-        !PlayerRouteObserver.instance.isPlayerActive.value;
+        !_mainPlaybackActive;
   }
 
   bool _useMedia3TrailerEngine() {
@@ -850,6 +861,9 @@ class _MediaBarState extends State<MediaBar>
       return;
     }
     if (_mainPlaybackActive) {
+      return;
+    }
+    if (PlayerRouteObserver.instance.isPlayerActive.value) {
       return;
     }
     if (_screensaverController.visible.value) {
