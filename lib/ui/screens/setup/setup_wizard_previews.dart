@@ -36,9 +36,33 @@ abstract final class SetupPreviewData {
   static List<MediaBarSlideItem> get items =>
       debugOverride?.value ?? _viewModel?.items ?? const [];
 
+  static bool _loading = false;
+
   static Future<void> ensureLoaded() async {
-    if (debugOverride != null) return;
-    await _viewModel?.load();
+    if (debugOverride != null || _loading) return;
+    final viewModel = _viewModel;
+    if (viewModel == null) return;
+
+    // The wizard runs seconds after the first sign-in, which is exactly when
+    // a first fetch can fail or come back empty, and load() treats any
+    // settled state as done and never runs again on its own. Without the
+    // forced retries a single early miss would leave every preview on the
+    // drawn stand-ins for the whole wizard.
+    _loading = true;
+    try {
+      const attempts = 4;
+      var delay = const Duration(seconds: 2);
+      for (var attempt = 0; attempt < attempts; attempt++) {
+        await viewModel.load(force: attempt > 0);
+        if (viewModel.items.isNotEmpty) return;
+        if (attempt < attempts - 1) {
+          await Future<void>.delayed(delay);
+          delay *= 2;
+        }
+      }
+    } finally {
+      _loading = false;
+    }
   }
 }
 

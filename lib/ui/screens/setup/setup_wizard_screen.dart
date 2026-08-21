@@ -167,6 +167,9 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
       unawaited(_finish());
       return;
     }
+    // Costs nothing once artwork is in, and gives a slow server another
+    // chance to fill the previews before the next step shows them.
+    unawaited(SetupPreviewData.ensureLoaded());
     setState(() {
       _advancing = true;
       _index++;
