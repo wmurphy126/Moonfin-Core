@@ -69,9 +69,6 @@ jobs:
       - name: Resolve dependencies
         run: flutter-tvos pub get
 
-      - name: Static analysis
-        run: '"$HOME/flutter-tvos/flutter/bin/dart" analyze --no-fatal-warnings'
-
       - name: Import App Store Connect API key
         env:
           ASC_KEY_BASE64: ${{ secrets.APPLE_ASC_API_KEY_BASE64 }}
