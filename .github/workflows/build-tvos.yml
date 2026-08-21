@@ -18,6 +18,7 @@ jobs:
   build-tvos:
     runs-on: macos-15
     timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v4
 
@@ -88,8 +89,6 @@ jobs:
 
       - name: Select Xcode 26 (tvOS 26 SDK)
         run: |
-          # App Store Connect rejects tvOS uploads not built against the tvOS 26
-          # SDK, which ships with Xcode 26. Pick the newest Xcode 26.x present.
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
 
           if [ -z "$XCODE" ]; then
@@ -111,7 +110,7 @@ jobs:
               exit 0
             fi
 
-            echo "downloadPlatform attempt $i failed (known flaky runner bug); retrying in 25s"
+            echo "downloadPlatform attempt $i failed; retrying in 25s"
             sleep 25
           done
 
@@ -189,6 +188,7 @@ jobs:
       - name: Stage flutter_assets for the Xcode copy phase
         run: |
           DEST="tvos/Flutter/flutter_assets"
+
           rm -rf "$DEST"
           mkdir -p "$DEST"
 
@@ -199,6 +199,7 @@ jobs:
             rsync -a "$SRC_APP/" "$DEST/"
           else
             echo "Staging from build/tvos bundle root"
+
             rsync -a \
               --exclude='*-appletvos' \
               --exclude='*-appletvsimulator' \
@@ -275,6 +276,7 @@ jobs:
 
           rm -rf "$RUNNER_TEMP/Payload" "$RUNNER_TEMP/moonfin.ipa"
           mkdir -p "$RUNNER_TEMP/Payload"
+
           cp -R "$APP" "$RUNNER_TEMP/Payload/"
 
           (
@@ -293,11 +295,24 @@ jobs:
           path: ${{ runner.temp }}/moonfin.ipa
           if-no-files-found: error
 
+      - name: Clear SwiftPM package state
+        if: ${{ inputs.distribution == 'testflight' }}
+        run: |
+          set -euo pipefail
+
+          echo "Clearing SwiftPM repository/package caches before archive..."
+
+          rm -rf "$HOME/Library/Caches/org.swift.swiftpm"
+          rm -rf "$RUNNER_TEMP/dd/SourcePackages"
+
+          echo "SwiftPM package state cleared."
+
       - name: Archive for App Store (TestFlight)
         if: ${{ inputs.distribution == 'testflight' }}
         run: |
           xcodebuild \
             -workspace tvos/Runner.xcworkspace \
+            -disablePackageRepositoryCache \
             -scheme Runner \
             -configuration Release \
             -sdk appletvos \
@@ -388,6 +403,7 @@ jobs:
             -authenticationKeyIssuerID "${{ secrets.APPLE_ASC_API_ISSUER_ID }}"
 
           EXPORT_STATUS=$?
+
           set -e
 
           if [ "$EXPORT_STATUS" -ne 0 ]; then
