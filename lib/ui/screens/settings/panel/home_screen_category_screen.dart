@@ -80,18 +80,6 @@ class _HomeScreenCategoryScreenState extends State<_HomeScreenCategoryScreen> {
                 enabled: isPaddingEnabled,
                 onChangeEnd: _pushPersonalizationSync,
               ),
-              if (!PlatformDetection.useMobileUi)
-                SwitchPreferenceTile(
-                  preference: UserPreferences.fullScreenRows,
-                  title: l10n.fullScreenRows,
-                  subtitle: l10n.fullScreenRowsDescription,
-                  icon: Icons.image_aspect_ratio,
-                  onChanged: () {
-                    _pushPersonalizationSync();
-                    if (!mounted) return;
-                    setState(() {});
-                  },
-                ),
             ],
           ),
 
