@@ -251,6 +251,8 @@ jobs:
           </dict>
           </plist>
           EOF
+                    set +e
+
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
@@ -259,3 +261,34 @@ jobs:
             -authenticationKeyPath "$ASC_KEY_PATH" \
             -authenticationKeyID "${{ secrets.APPLE_ASC_API_KEY_ID }}" \
             -authenticationKeyIssuerID "${{ secrets.APPLE_ASC_API_ISSUER_ID }}"
+
+          EXPORT_STATUS=$?
+          set -e
+
+          if [ "$EXPORT_STATUS" -ne 0 ]; then
+            echo
+            echo "===== TestFlight export failed: collecting Xcode distribution diagnostics ====="
+
+            LOG_BUNDLE=$(ls -td /var/folders/*/*/T/Runner_*.xcdistributionlogs 2>/dev/null | head -1 || true)
+
+            if [ -n "$LOG_BUNDLE" ]; then
+              echo "Found distribution log bundle."
+
+              for LOG_NAME in IDEDistribution.critical.log IDEDistribution.standard.log; do
+                LOG_FILE="$LOG_BUNDLE/$LOG_NAME"
+
+                if [ -f "$LOG_FILE" ]; then
+                  echo
+                  echo "===== $LOG_NAME: last 200 lines ====="
+
+                  tail -n 200 "$LOG_FILE" \
+                    | sed -E 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1[REDACTED]/g' \
+                    | sed -E 's/(Authorization:[[:space:]]*)[^[:space:]]+/\1[REDACTED]/g'
+                fi
+              done
+            else
+              echo "No xcdistributionlogs bundle found."
+            fi
+
+            exit "$EXPORT_STATUS"
+          fi
