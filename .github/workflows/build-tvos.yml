@@ -21,30 +21,118 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Personalize private tvOS build
+        env:
+          TEST_BUNDLE_ID: com.wmurphy126.moonfintest
+          TEST_TOPSHELF_BUNDLE_ID: com.wmurphy126.moonfintest.topshelf
+          TEST_APP_GROUP: group.com.wmurphy126.moonfintest
+          TEST_DISPLAY_NAME: Moonfin Test
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          replacements = {
+              "org.moonfin.app.topshelf": os.environ["TEST_TOPSHELF_BUNDLE_ID"],
+              "group.org.moonfin.app": os.environ["TEST_APP_GROUP"],
+              "org.moonfin.app": os.environ["TEST_BUNDLE_ID"],
+          }
+
+          files = [
+              Path("tvos/Runner.xcodeproj/project.pbxproj"),
+              Path("tvos/Runner/Runner.entitlements"),
+              Path("tvos/MoonfinTopShelf/MoonfinTopShelf.entitlements"),
+              Path("tvos/MoonfinTopShelf/ServiceProvider.swift"),
+              Path("tvos/Runner/Info.plist"),
+          ]
+
+          for path in files:
+              text = path.read_text()
+              original = text
+
+              for old, new in replacements.items():
+                  text = text.replace(old, new)
+
+              if path == Path("tvos/Runner/Info.plist"):
+                  text, count = re.subn(
+                      r"(<key>CFBundleDisplayName</key>\s*<string>)[^<]*(</string>)",
+                      rf"\g<1>{os.environ['TEST_DISPLAY_NAME']}\g<2>",
+                      text,
+                      count=1,
+                  )
+                  if count != 1:
+                      raise SystemExit(
+                          "Could not update CFBundleDisplayName in tvOS Info.plist"
+                      )
+
+              if text != original:
+                  path.write_text(text)
+                  print(f"Personalized {path}")
+
+          checks = {
+              Path("tvos/Runner.xcodeproj/project.pbxproj"): [
+                  os.environ["TEST_BUNDLE_ID"],
+                  os.environ["TEST_TOPSHELF_BUNDLE_ID"],
+              ],
+              Path("tvos/Runner/Runner.entitlements"): [
+                  os.environ["TEST_APP_GROUP"]
+              ],
+              Path("tvos/MoonfinTopShelf/MoonfinTopShelf.entitlements"): [
+                  os.environ["TEST_APP_GROUP"]
+              ],
+              Path("tvos/MoonfinTopShelf/ServiceProvider.swift"): [
+                  os.environ["TEST_APP_GROUP"]
+              ],
+              Path("tvos/Runner/Info.plist"): [
+                  os.environ["TEST_BUNDLE_ID"],
+                  os.environ["TEST_DISPLAY_NAME"],
+              ],
+          }
+
+          for path, expected_values in checks.items():
+              text = path.read_text()
+
+              for value in expected_values:
+                  if value not in text:
+                      raise SystemExit(
+                          f"Expected {value} was not applied to {path}"
+                      )
+
+          print(
+              "Private tvOS identifiers and display name applied successfully."
+          )
+          PY
+
       - name: Select Xcode 26 (tvOS 26 SDK)
         run: |
-          # App Store Connect rejects tvOS uploads not built against the tvOS 26
-          # SDK, which ships with Xcode 26. Pick the newest Xcode 26.x present.
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+
           if [ -z "$XCODE" ]; then
             echo "::error::Xcode 26 not found on runner; required for the tvOS 26 SDK"
             ls -d /Applications/Xcode*.app || true
             exit 1
           fi
+
           sudo xcode-select -s "$XCODE"
           xcodebuild -version
 
       - name: Install tvOS platform
         run: |
           sudo xcodebuild -runFirstLaunch || true
+
           for i in 1 2 3 4 5 6; do
             if xcodebuild -downloadPlatform tvOS; then
               echo "tvOS platform installed on attempt $i"
               exit 0
             fi
+
             echo "downloadPlatform attempt $i failed (known flaky runner bug); retrying in 25s"
             sleep 25
           done
+
           echo "::error::tvOS platform install failed after 6 attempts"
           exit 1
 
@@ -74,42 +162,89 @@ jobs:
           ASC_KEY_BASE64: ${{ secrets.APPLE_ASC_API_KEY_BASE64 }}
         run: |
           if [ -z "$ASC_KEY_BASE64" ]; then
-            echo "::error::APPLE_ASC_API_KEY_BASE64 secret is missing" && exit 1
+            echo "::error::APPLE_ASC_API_KEY_BASE64 secret is missing"
+            exit 1
           fi
+
           mkdir -p "$RUNNER_TEMP/asc"
           echo "$ASC_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/asc/AuthKey.p8"
           echo "ASC_KEY_PATH=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
 
       - name: Prepare Flutter build settings and pods
         run: |
-          flutter-tvos build tvos --release --no-tree-shake-icons --dart-define=MOONFIN_TVOS=true || true
+          set -euo pipefail
+
+          BASE_BUILD=$(awk -F'+' '/^version:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' pubspec.yaml)
+
+          if ! [[ "$BASE_BUILD" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not read a numeric build number from pubspec.yaml"
+            exit 1
+          fi
+
+          BUILD_NUMBER=$((BASE_BUILD + GITHUB_RUN_NUMBER * 1000 + GITHUB_RUN_ATTEMPT))
+
+          echo "MOONFIN_TVOS_BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "Using private tvOS build number: $BUILD_NUMBER"
+
+            flutter-tvos build tvos \
+              --release \
+              --no-tree-shake-icons \
+              --build-name=2.5.10 \
+              --build-number="$BUILD_NUMBER" \
+              --dart-define=MOONFIN_TVOS=true || true
+
           test -f tvos/Flutter/Generated.xcconfig
+
           grep -q '^FLUTTER_ROOT=' tvos/Flutter/Generated.xcconfig \
             || echo "FLUTTER_ROOT=$HOME/flutter-tvos" >> tvos/Flutter/Generated.xcconfig
+
+          ACTUAL_BUILD=$(awk -F= '/^FLUTTER_BUILD_NUMBER=/{print $2; exit}' tvos/Flutter/Generated.xcconfig)
+
+          if [ "$ACTUAL_BUILD" != "$BUILD_NUMBER" ]; then
+            echo "::error::Generated Flutter build number ($ACTUAL_BUILD) does not match expected build number ($BUILD_NUMBER)"
+            exit 1
+          fi
 
       - name: Stage flutter_assets for the Xcode copy phase
         run: |
           DEST="tvos/Flutter/flutter_assets"
+
           rm -rf "$DEST"
           mkdir -p "$DEST"
+
           SRC_APP=$(find build/tvos -maxdepth 3 -type d -path "*Release-appletvos/Runner.app/flutter_assets" | head -1)
+
           if [ -n "$SRC_APP" ]; then
             echo "Staging from assembled app bundle: $SRC_APP"
             rsync -a "$SRC_APP/" "$DEST/"
           else
             echo "Staging from build/tvos bundle root"
+
             rsync -a \
-              --exclude='*-appletvos' --exclude='*-appletvsimulator' \
-              --exclude='aot' --exclude='.last_build_id' \
-              --exclude='kernel_blob.bin' --exclude='vm_snapshot_data' \
+              --exclude='*-appletvos' \
+              --exclude='*-appletvsimulator' \
+              --exclude='aot' \
+              --exclude='.last_build_id' \
+              --exclude='kernel_blob.bin' \
+              --exclude='vm_snapshot_data' \
               --exclude='isolate_snapshot_data' \
               build/tvos/ "$DEST/"
           fi
+
           test -f "$DEST/fonts/MaterialIcons-Regular.otf" \
-            || { echo "::error::MaterialIcons font missing from staged flutter_assets"; exit 1; }
+            || {
+              echo "::error::MaterialIcons font missing from staged flutter_assets"
+              exit 1
+            }
+
           test -f "$DEST/AssetManifest.bin" \
-            || { echo "::error::AssetManifest.bin missing from staged flutter_assets"; exit 1; }
-          echo "Staged flutter_assets:" && ls "$DEST"
+            || {
+              echo "::error::AssetManifest.bin missing from staged flutter_assets"
+              exit 1
+            }
+
+          echo "Staged flutter_assets:"
+          ls "$DEST"
 
       - name: Build signed app for device
         if: ${{ inputs.distribution == 'dev' }}
@@ -133,21 +268,44 @@ jobs:
         if: ${{ inputs.distribution == 'dev' }}
         run: |
           APP="$RUNNER_TEMP/dd/Build/Products/Release-appletvos/Runner.app"
+
           test -d "$APP"
+
           test -f "$APP/flutter_assets/fonts/MaterialIcons-Regular.otf" \
-            || { echo "::error::Built app is missing flutter_assets fonts"; exit 1; }
+            || {
+              echo "::error::Built app is missing flutter_assets fonts"
+              exit 1
+            }
+
           test -e "$APP/PlugIns/MoonfinTopShelf.appex/MoonfinTopShelf" \
-            || { echo "::error::Top Shelf extension missing from PlugIns"; exit 1; }
+            || {
+              echo "::error::Top Shelf extension missing from PlugIns"
+              exit 1
+            }
+
           PLIST_MIN=$(plutil -extract MinimumOSVersion raw "$APP/Frameworks/App.framework/Info.plist")
           BIN_MIN=$(vtool -show-build "$APP/Frameworks/App.framework/App" | awk '/minos/{print $2; exit}')
+
           echo "App.framework Info.plist MinimumOSVersion=$PLIST_MIN, binary minos=$BIN_MIN"
+
           [ "$PLIST_MIN" = "$BIN_MIN" ] \
-            || { echo "::error::App.framework MinimumOSVersion ($PLIST_MIN) != binary minos ($BIN_MIN) (ITMS-90208)"; exit 1; }
+            || {
+              echo "::error::App.framework MinimumOSVersion ($PLIST_MIN) != binary minos ($BIN_MIN) (ITMS-90208)"
+              exit 1
+            }
+
           rm -rf "$RUNNER_TEMP/Payload" "$RUNNER_TEMP/moonfin.ipa"
           mkdir -p "$RUNNER_TEMP/Payload"
+
           cp -R "$APP" "$RUNNER_TEMP/Payload/"
-          ( cd "$RUNNER_TEMP" && zip -qry moonfin.ipa Payload )
-          unzip -l "$RUNNER_TEMP/moonfin.ipa" | grep -q "Payload/Runner.app/Runner"
+
+          (
+            cd "$RUNNER_TEMP"
+            zip -qry moonfin.ipa Payload
+          )
+
+          unzip -l "$RUNNER_TEMP/moonfin.ipa" \
+            | grep -q "Payload/Runner.app/Runner"
 
       - name: Upload IPA artifact
         if: ${{ inputs.distribution == 'dev' }}
@@ -173,18 +331,50 @@ jobs:
             -authenticationKeyID "${{ secrets.APPLE_ASC_API_KEY_ID }}" \
             -authenticationKeyIssuerID "${{ secrets.APPLE_ASC_API_ISSUER_ID }}" \
             CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY=- \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             archive
-          APPEX="$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app/PlugIns/MoonfinTopShelf.appex/MoonfinTopShelf"
-          test -e "$APPEX" \
-            || { echo "::error::Top Shelf extension missing from archive"; exit 1; }
+
           APP="$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app"
+
+          APP_BUILD=$(plutil -extract CFBundleVersion raw "$APP/Info.plist")
+          EXT_BUILD=$(plutil -extract CFBundleVersion raw "$APP/PlugIns/MoonfinTopShelf.appex/Info.plist")
+
+          echo "Archived Runner build number: $APP_BUILD"
+          echo "Archived Top Shelf build number: $EXT_BUILD"
+
+          [ "$APP_BUILD" = "$MOONFIN_TVOS_BUILD_NUMBER" ] \
+            || {
+              echo "::error::Runner build number does not match generated tvOS build number"
+              exit 1
+            }
+
+          [ "$EXT_BUILD" = "$APP_BUILD" ] \
+            || {
+              echo "::error::Top Shelf build number does not match Runner"
+              exit 1
+            }
+
+          APPEX="$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app/PlugIns/MoonfinTopShelf.appex/MoonfinTopShelf"
+
+          test -e "$APPEX" \
+            || {
+              echo "::error::Top Shelf extension missing from archive"
+              exit 1
+            }
+
           PLIST_MIN=$(plutil -extract MinimumOSVersion raw "$APP/Frameworks/App.framework/Info.plist")
           BIN_MIN=$(vtool -show-build "$APP/Frameworks/App.framework/App" | awk '/minos/{print $2; exit}')
+
           echo "App.framework Info.plist MinimumOSVersion=$PLIST_MIN, binary minos=$BIN_MIN"
+
           [ "$PLIST_MIN" = "$BIN_MIN" ] \
-            || { echo "::error::App.framework MinimumOSVersion ($PLIST_MIN) != binary minos ($BIN_MIN) (ITMS-90208)"; exit 1; }
+            || {
+              echo "::error::App.framework MinimumOSVersion ($PLIST_MIN) != binary minos ($BIN_MIN) (ITMS-90208)"
+              exit 1
+            }
 
       - name: Export and upload to TestFlight
         if: ${{ inputs.distribution == 'testflight' }}
@@ -207,6 +397,9 @@ jobs:
           </dict>
           </plist>
           EOF
+
+          set +e
+
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
@@ -215,3 +408,34 @@ jobs:
             -authenticationKeyPath "$ASC_KEY_PATH" \
             -authenticationKeyID "${{ secrets.APPLE_ASC_API_KEY_ID }}" \
             -authenticationKeyIssuerID "${{ secrets.APPLE_ASC_API_ISSUER_ID }}"
+
+          EXPORT_STATUS=$?
+          set -e
+
+          if [ "$EXPORT_STATUS" -ne 0 ]; then
+            echo
+            echo "===== TestFlight export failed: collecting Xcode distribution diagnostics ====="
+
+            LOG_BUNDLE=$(ls -td /var/folders/*/*/T/Runner_*.xcdistributionlogs 2>/dev/null | head -1 || true)
+
+            if [ -n "$LOG_BUNDLE" ]; then
+              echo "Found distribution log bundle."
+
+              for LOG_NAME in IDEDistribution.critical.log IDEDistribution.standard.log; do
+                LOG_FILE="$LOG_BUNDLE/$LOG_NAME"
+
+                if [ -f "$LOG_FILE" ]; then
+                  echo
+                  echo "===== $LOG_NAME: last 200 lines ====="
+
+                  tail -n 200 "$LOG_FILE" \
+                    | sed -E 's/(Bearer[[:space:]]+)[A-Za-z0-9._-]+/\1[REDACTED]/g' \
+                    | sed -E 's/(Authorization:[[:space:]]*)[^[:space:]]+/\1[REDACTED]/g'
+                fi
+              done
+            else
+              echo "No xcdistributionlogs bundle found."
+            fi
+
+            exit "$EXPORT_STATUS"
+          fi
