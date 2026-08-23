@@ -15302,6 +15302,7 @@ class _TrackTileState extends State<TrackTile> with FocusStateMixin {
     final theme = Theme.of(context);
     final runtime = widget.track.runtime;
     final isAudio = widget.track.type == 'Audio';
+    final isCompactAudio = isAudio && _isCompact(context);
     final runtimeText = runtime != null
         ? (isAudio
               ? '${runtime.inMinutes}:${(runtime.inSeconds % 60).toString().padLeft(2, '0')}'
@@ -15351,6 +15352,13 @@ class _TrackTileState extends State<TrackTile> with FocusStateMixin {
             }
             return artistText.isNotEmpty ? artistText : null;
           }();
+
+    final compactSubtitleParts = <String>[?subtitle, ?runtimeText];
+    final secondaryText = isCompactAudio
+        ? (compactSubtitleParts.isEmpty
+              ? null
+              : compactSubtitleParts.join(' • '))
+        : subtitle;
 
     Widget? thumbnailWidget;
     if (widget.isPlaylist && widget.imageApi != null) {
@@ -15537,9 +15545,9 @@ class _TrackTileState extends State<TrackTile> with FocusStateMixin {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      if (subtitle != null)
+                      if (secondaryText != null)
                         Text(
-                          subtitle,
+                          secondaryText,
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: showFocusBorder
                                 ? Colors.white.withValues(alpha: 0.82)
@@ -15552,6 +15560,7 @@ class _TrackTileState extends State<TrackTile> with FocusStateMixin {
                   ),
                 ),
                 () {
+                  if (isCompactAudio) return const SizedBox.shrink();
                   final releaseYear =
                       widget.track.productionYear ??
                       (widget.track.premiereDate != null
