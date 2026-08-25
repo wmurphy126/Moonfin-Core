@@ -24,7 +24,9 @@ class AppDelegate: FlutterAppDelegate {
         self.window = window
         // The engine installs its press recognizers in viewDidLoad, which
         // reading the view forces before the gate looks for them.
-        pressGate = SiriRemotePressGate.install(on: flutterViewController.view)
+        pressGate = SiriRemotePressGate.install(
+            on: flutterViewController.view,
+            messenger: flutterViewController.binaryMessenger)
 
         GeneratedPluginRegistrant.register(with: self)
 
