@@ -1,7 +1,11 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter_tvos/flutter_tvos.dart'
     show TvRemoteController, TvRemoteTouchEvent, TvRemoteTouchPhase;
 
+import '../platform_detection.dart';
 import 'gamepad/gamepad_key_synthesizer.dart';
 
 /// Turns Siri Remote touchpad gestures into focus navigation. Focus steps one
@@ -9,12 +13,13 @@ import 'gamepad/gamepad_key_synthesizer.dart';
 /// drag moves the same number of items however fast it was made.
 ///
 /// The arrow presses tvOS makes out of swipes are held back natively by
-/// SiriRemotePressGate, and the engine's own swipe detectors are switched off
-/// by config, since one emits a single arrow per gesture and the other latches
-/// while the finger rests and runs focus away. Clicks and buttons stay native.
-/// Steps go out as real arrow key events through [GamepadKeySynthesizer], so
-/// every existing key handler and focus widget behaves exactly as it does for
-/// a click.
+/// SiriRemotePressGate, which is told from here when the pad is touched so it
+/// can tell a swipe apart from a remote that only sends arrows. The engine's
+/// own swipe detectors are switched off by config, since one emits a single
+/// arrow per gesture and the other latches while the finger rests and runs
+/// focus away. Clicks and buttons stay native. Steps go out as real arrow key
+/// events through [GamepadKeySynthesizer], so every existing key handler and
+/// focus widget behaves exactly as it does for a click.
 ///
 /// While a native view controller covers Flutter the engine stops forwarding
 /// touches, so this layer goes quiet on its own.
@@ -29,6 +34,8 @@ class SiriRemoteGlide {
 
   /// Travel between steps after the first.
   static const double _stepTravel = 0.36;
+
+  static const MethodChannel _gate = MethodChannel('moonfin/siri_remote_gate');
 
   final GamepadKeySynthesizer _synthesizer = GamepadKeySynthesizer();
 
@@ -67,7 +74,7 @@ class SiriRemoteGlide {
         _onMove(event.x, event.y);
       case TvRemoteTouchPhase.ended:
       case TvRemoteTouchPhase.cancelled:
-        _touching = false;
+        _setTouching(false);
       case TvRemoteTouchPhase.loc:
       case TvRemoteTouchPhase.clickStart:
       case TvRemoteTouchPhase.clickEnd:
@@ -76,12 +83,26 @@ class SiriRemoteGlide {
   }
 
   void _beginGesture(double x, double y) {
-    _touching = true;
+    _setTouching(true);
     _lastX = x;
     _lastY = y;
     _accX = 0;
     _accY = 0;
     _steppedThisGesture = false;
+  }
+
+  /// Tells the native press gate whether a finger is on the pad. The gate is
+  /// absent if the engine ever stops putting recognizers on its presses, and a
+  /// report nobody listens for is no reason to break the gesture.
+  void _setTouching(bool touching) {
+    if (touching == _touching) return;
+    _touching = touching;
+    if (!PlatformDetection.isAppleTV) return;
+    unawaited(
+      _gate
+          .invokeMethod<void>('setPadTouched', touching)
+          .catchError((Object _) {}),
+    );
   }
 
   void _onMove(double x, double y) {
