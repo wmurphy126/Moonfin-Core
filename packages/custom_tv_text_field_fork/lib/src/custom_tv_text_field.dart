@@ -64,6 +64,7 @@ class CustomTVTextField extends StatefulWidget {
   final KeyboardSuggestionBuilder? suggestionsBuilder;
   final List<String> recentSuggestions;
   final bool preferSystemIme;
+  final bool submitOnSystemImeClose;
   final int maxLines;
   final bool popParentOnKeyboardClose;
 
@@ -104,6 +105,7 @@ class CustomTVTextField extends StatefulWidget {
     this.suggestionsBuilder,
     this.recentSuggestions = const [],
     this.preferSystemIme = false,
+    this.submitOnSystemImeClose = false,
     this.maxLines = 1,
     this.popParentOnKeyboardClose = true,
   });
@@ -313,6 +315,9 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
 
   void _onSystemInputFocusChanged() {
     if (!_systemInputFocusNode.hasFocus && _useSystemImeSession) {
+      if (widget.submitOnSystemImeClose) {
+        widget.onFieldSubmitted?.call(widget.controller.text);
+      }
       _deactivateSystemIme();
     }
     _notifyVisibilityChanged();
@@ -396,7 +401,7 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
 
   void closeKeyboard() {
     if (_keyboardController.isVisible) {
-      _keyboardController.hide(true);
+      _keyboardController.hide(false);
       return;
     }
     _deactivateSystemIme();
@@ -579,7 +584,9 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
                               contentPadding: EdgeInsets.zero,
                             ),
                             onSubmitted: (value) {
-                              widget.onFieldSubmitted?.call(value);
+                              if (!widget.submitOnSystemImeClose || _useSystemImeSession) {
+                                widget.onFieldSubmitted?.call(value);
+                              }
                               _deactivateSystemIme();
                             },
                           ),

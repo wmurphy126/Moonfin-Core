@@ -666,6 +666,7 @@ class _CreateGroupSection extends StatelessWidget {
               isFocused: focused,
               inputPurpose: InputPurpose.text,
               preferSystemIme: prefs.get(UserPreferences.preferSystemImeKeyboard),
+              submitOnSystemImeClose: true,
               hint: l10n.syncPlayGroupName,
               textFieldType: TextFieldType.other,
               keyboardType: KeyboardType.alphabetic,

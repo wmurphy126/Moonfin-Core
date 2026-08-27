@@ -17,6 +17,7 @@ void main() {
     final controller = TextEditingController(text: 'dune');
     addTearDown(controller.dispose);
     final fieldKey = GlobalKey<CustomTVTextFieldState>();
+    var submissions = 0;
 
     await tester.pumpWidget(
       MaterialApp(
@@ -28,6 +29,7 @@ void main() {
                 key: fieldKey,
                 controller: controller,
                 popParentOnKeyboardClose: false,
+                onFieldSubmitted: (_) => submissions++,
               ),
             ],
           ),
@@ -51,6 +53,7 @@ void main() {
     expect(find.byType(CustomKeyboard), findsNothing);
     expect(find.text('search results'), findsOneWidget);
     expect(controller.text, 'dune');
+    expect(submissions, 0);
     expect(CustomTVTextField.closeTopKeyboard(), isFalse);
   });
 
@@ -80,5 +83,49 @@ void main() {
     await _settle(tester);
 
     expect(CustomTVTextField.closeTopKeyboard(), isFalse);
+  });
+
+  testWidgets('system IME submit and cancel paths fire exactly as intended', (
+    tester,
+  ) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    final fieldKey = GlobalKey<CustomTVTextFieldState>();
+    final submissions = <String>[];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CustomTVTextField(
+            key: fieldKey,
+            controller: controller,
+            preferSystemIme: true,
+            submitOnSystemImeClose: true,
+            onFieldSubmitted: submissions.add,
+          ),
+        ),
+      ),
+    );
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Friday watch party');
+    tester.testTextInput.closeConnection();
+    await _settle(tester);
+    expect(submissions, ['Friday watch party']);
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Saturday watch party');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await _settle(tester);
+    expect(submissions, ['Friday watch party', 'Saturday watch party']);
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Cancelled watch party');
+    expect(CustomTVTextField.closeTopKeyboard(), isTrue);
+    await _settle(tester);
+    expect(submissions, ['Friday watch party', 'Saturday watch party']);
   });
 }
