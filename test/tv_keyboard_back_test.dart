@@ -81,4 +81,47 @@ void main() {
 
     expect(CustomTVTextField.closeTopKeyboard(), isFalse);
   });
+
+  testWidgets('system IME submit and cancel paths fire exactly as intended', (
+    tester,
+  ) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    final fieldKey = GlobalKey<CustomTVTextFieldState>();
+    final submissions = <String>[];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CustomTVTextField(
+            key: fieldKey,
+            controller: controller,
+            preferSystemIme: true,
+            onFieldSubmitted: submissions.add,
+          ),
+        ),
+      ),
+    );
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Friday watch party');
+    tester.testTextInput.closeConnection();
+    await _settle(tester);
+    expect(submissions, ['Friday watch party']);
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Saturday watch party');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await _settle(tester);
+    expect(submissions, ['Friday watch party', 'Saturday watch party']);
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Cancelled watch party');
+    fieldKey.currentState!.closeKeyboard();
+    await _settle(tester);
+    expect(submissions, ['Friday watch party', 'Saturday watch party']);
+  });
 }
