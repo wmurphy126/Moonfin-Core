@@ -1,7 +1,21 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'keyboard_controller.dart';
+
+const MethodChannel _appleTvSystemChannel = MethodChannel(
+  'moonfin/appletv_system',
+);
+CustomTVTextFieldState? _activeNativeSystemImeField;
+
+Future<void> _handleAppleTvSystemCall(MethodCall call) async {
+  if (call.method == 'systemTextInputSubmitted') {
+    final value = call.arguments as String? ?? '';
+    _activeNativeSystemImeField?._submitNativeSystemIme(value);
+  }
+}
 
 enum TextFieldType {
   email,
@@ -129,6 +143,7 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
   BuildContext? _keyboardOverlayContext;
 
   bool _useSystemImeSession = false;
+  bool _useNativeSystemIme = false;
 
   bool get _isSystemImeActive => _useSystemImeSession;
 
@@ -419,7 +434,7 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
       });
     }
 
-    _requestSystemInputFocus();
+    unawaited(_requestSystemInputFocus());
     _notifyVisibilityChanged();
   }
 
@@ -427,11 +442,21 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
     if (!_useSystemImeSession) return;
 
     final inputHeldFocus = _systemInputFocusNode.hasFocus;
+    final usedNativeSystemIme = _useNativeSystemIme;
+
+    if (identical(_activeNativeSystemImeField, this)) {
+      _activeNativeSystemImeField = null;
+    }
+    _useNativeSystemIme = false;
 
     setState(() {
       _useSystemImeSession = false;
     });
     _notifyVisibilityChanged();
+
+    if (usedNativeSystemIme) {
+      unawaited(_appleTvSystemChannel.invokeMethod<void>('hideTextInput'));
+    }
 
     _systemInputFocusNode.unfocus();
     _systemInputFocusNode.canRequestFocus = false;
@@ -445,7 +470,40 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
     } catch (_) {}
   }
 
-  void _requestSystemInputFocus() {
+  Future<void> _requestSystemInputFocus() async {
+    _appleTvSystemChannel.setMethodCallHandler(_handleAppleTvSystemCall);
+    _activeNativeSystemImeField = this;
+    try {
+      final shown = await _appleTvSystemChannel
+          .invokeMethod<bool>('showTextInput', <String, Object>{
+            'text': widget.controller.text,
+            'hint': widget.hint,
+            'purpose': widget.inputPurpose.name,
+            'obscureText': widget.obscureText,
+          });
+      if (!mounted || !_useSystemImeSession) {
+        if (shown ?? false) {
+          unawaited(_appleTvSystemChannel.invokeMethod<void>('hideTextInput'));
+        }
+        return;
+      }
+      if (shown ?? false) {
+        _useNativeSystemIme = true;
+        return;
+      }
+    } on MissingPluginException {
+      // Non-tvOS platforms use Flutter's normal text input path below.
+    } on PlatformException {
+      // Fall back if the native tvOS text field could not be presented.
+    }
+
+    if (identical(_activeNativeSystemImeField, this)) {
+      _activeNativeSystemImeField = null;
+    }
+    _requestFlutterSystemInputFocus();
+  }
+
+  void _requestFlutterSystemInputFocus() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_useSystemImeSession) return;
       _systemInputFocusNode.requestFocus();
@@ -471,6 +529,19 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
         });
       });
     });
+  }
+
+  void _submitNativeSystemIme(String value) {
+    if (!_useSystemImeSession || !_useNativeSystemIme) return;
+    widget.controller.text = value;
+    _useNativeSystemIme = false;
+    _submitSystemIme(value);
+  }
+
+  void _submitSystemIme(String value) {
+    if (!_useSystemImeSession) return;
+    _deactivateSystemIme();
+    widget.onFieldSubmitted?.call(value);
   }
 
   TextInputType _systemKeyboardType() {
@@ -524,6 +595,12 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
 
   @override
   void dispose() {
+    if (identical(_activeNativeSystemImeField, this)) {
+      _activeNativeSystemImeField = null;
+      if (_useNativeSystemIme) {
+        unawaited(_appleTvSystemChannel.invokeMethod<void>('hideTextInput'));
+      }
+    }
     if (isKeyboardVisible) {
       CustomTVTextField.isKeyboardVisibleNotifier.value = false;
     }
@@ -578,10 +655,7 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
                               isDense: true,
                               contentPadding: EdgeInsets.zero,
                             ),
-                            onSubmitted: (value) {
-                              widget.onFieldSubmitted?.call(value);
-                              _deactivateSystemIme();
-                            },
+                            onSubmitted: _submitSystemIme,
                           ),
                         ),
                       ),
