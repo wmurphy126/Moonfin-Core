@@ -313,6 +313,7 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
 
   void _onSystemInputFocusChanged() {
     if (!_systemInputFocusNode.hasFocus && _useSystemImeSession) {
+      widget.onFieldSubmitted?.call(widget.controller.text);
       _deactivateSystemIme();
     }
     _notifyVisibilityChanged();
@@ -579,7 +580,7 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
                               contentPadding: EdgeInsets.zero,
                             ),
                             onSubmitted: (value) {
-                              widget.onFieldSubmitted?.call(value);
+                              if (_useSystemImeSession) widget.onFieldSubmitted?.call(value);
                               _deactivateSystemIme();
                             },
                           ),
