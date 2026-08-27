@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:custom_tv_text_field/custom_tv_text_field.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The caret blink never stops on its own, so settle with fixed pumps
@@ -12,6 +15,13 @@ Future<void> _settle(WidgetTester tester) async {
 /// The app's back handling asks the keyboard to claim the press before it
 /// pops anything, so these pin the answers it relies on.
 void main() {
+  const appleTvSystemChannel = MethodChannel('moonfin/appletv_system');
+
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(appleTvSystemChannel, null);
+  });
+
   testWidgets('closing the top keyboard leaves the page it belongs to up',
       (tester) async {
     final controller = TextEditingController(text: 'dune');
@@ -80,5 +90,43 @@ void main() {
     await _settle(tester);
 
     expect(CustomTVTextField.closeTopKeyboard(), isFalse);
+  });
+
+  testWidgets('tvOS native keyboard returns and submits its final text', (
+    tester,
+  ) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    final submissions = <String>[];
+    final fieldKey = GlobalKey<CustomTVTextFieldState>();
+    final nativeResult = Completer<String?>();
+
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(appleTvSystemChannel, (call) async {
+          if (call.method == 'showTextInput') return nativeResult.future;
+          return null;
+        });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CustomTVTextField(
+            key: fieldKey,
+            controller: controller,
+            preferSystemIme: true,
+            onFieldSubmitted: submissions.add,
+          ),
+        ),
+      ),
+    );
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    nativeResult.complete('Friday watch party');
+    await _settle(tester);
+
+    expect(controller.text, 'Friday watch party');
+    expect(submissions, ['Friday watch party']);
+    expect(fieldKey.currentState!.isKeyboardVisible, isFalse);
   });
 }
