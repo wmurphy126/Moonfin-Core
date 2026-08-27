@@ -3,6 +3,15 @@ import 'package:flutter/services.dart';
 
 import 'keyboard_controller.dart';
 
+const _appleTvSystemChannel = MethodChannel('moonfin/appletv_system');
+CustomTVTextFieldState? _activeSystemImeField;
+
+Future<void> _handleSystemKeyboardCall(MethodCall call) async {
+  if (call.method == 'systemKeyboardDidHide') {
+    _activeSystemImeField?._submitSystemIme();
+  }
+}
+
 enum TextFieldType {
   email,
   password,
@@ -411,6 +420,8 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
       _keyboardController.hide(false);
     }
 
+    _appleTvSystemChannel.setMethodCallHandler(_handleSystemKeyboardCall);
+    _activeSystemImeField = this;
     _systemInputFocusNode.canRequestFocus = true;
 
     if (!_useSystemImeSession) {
@@ -426,6 +437,9 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
   void _deactivateSystemIme() {
     if (!_useSystemImeSession) return;
 
+    if (identical(_activeSystemImeField, this)) {
+      _activeSystemImeField = null;
+    }
     final inputHeldFocus = _systemInputFocusNode.hasFocus;
 
     setState(() {
@@ -443,6 +457,12 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
         parentFocus.requestFocus();
       }
     } catch (_) {}
+  }
+
+  void _submitSystemIme([String? value]) {
+    if (!_useSystemImeSession) return;
+    _deactivateSystemIme();
+    widget.onFieldSubmitted?.call(value ?? widget.controller.text);
   }
 
   void _requestSystemInputFocus() {
@@ -524,6 +544,9 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
 
   @override
   void dispose() {
+    if (identical(_activeSystemImeField, this)) {
+      _activeSystemImeField = null;
+    }
     if (isKeyboardVisible) {
       CustomTVTextField.isKeyboardVisibleNotifier.value = false;
     }
@@ -578,10 +601,7 @@ class CustomTVTextFieldState extends State<CustomTVTextField>
                               isDense: true,
                               contentPadding: EdgeInsets.zero,
                             ),
-                            onSubmitted: (value) {
-                              widget.onFieldSubmitted?.call(value);
-                              _deactivateSystemIme();
-                            },
+                            onSubmitted: _submitSystemIme,
                           ),
                         ),
                       ),

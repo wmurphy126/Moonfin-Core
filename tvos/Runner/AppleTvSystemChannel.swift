@@ -15,6 +15,16 @@ final class AppleTvSystemChannel: NSObject {
         channel.setMethodCallHandler { [weak self] call, result in
             self?.handle(call, result: result)
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(systemKeyboardDidHide),
+            name: UIResponder.keyboardDidHideNotification,
+            object: nil)
+    }
+
+    @objc private func systemKeyboardDidHide(_ notification: Notification) {
+        guard UIApplication.shared.applicationState == .active else { return }
+        channel.invokeMethod("systemKeyboardDidHide", arguments: nil)
     }
 
     private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {

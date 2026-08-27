@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:custom_tv_text_field/custom_tv_text_field.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The caret blink never stops on its own, so settle with fixed pumps
@@ -7,6 +10,19 @@ import 'package:flutter_test/flutter_test.dart';
 Future<void> _settle(WidgetTester tester) async {
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 400));
+}
+
+Future<void> _dismissSystemKeyboard(WidgetTester tester) async {
+  unawaited(
+    tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+      'moonfin/appletv_system',
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('systemKeyboardDidHide'),
+      ),
+      null,
+    ),
+  );
+  await tester.pump();
 }
 
 /// The app's back handling asks the keyboard to claim the press before it
@@ -80,5 +96,48 @@ void main() {
     await _settle(tester);
 
     expect(CustomTVTextField.closeTopKeyboard(), isFalse);
+  });
+
+  testWidgets('tvOS keyboard dismissal submits its active field once', (
+    tester,
+  ) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    final fieldKey = GlobalKey<CustomTVTextFieldState>();
+    final submissions = <String>[];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CustomTVTextField(
+            key: fieldKey,
+            controller: controller,
+            preferSystemIme: true,
+            onFieldSubmitted: submissions.add,
+          ),
+        ),
+      ),
+    );
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Friday watch party');
+    await tester.pump();
+
+    await _dismissSystemKeyboard(tester);
+    expect(submissions, ['Friday watch party']);
+    expect(fieldKey.currentState!.isKeyboardVisible, isFalse);
+
+    await _dismissSystemKeyboard(tester);
+    expect(submissions, ['Friday watch party']);
+
+    fieldKey.currentState!.openKeyboard();
+    await _settle(tester);
+    tester.testTextInput.enterText('Saturday watch party');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await _settle(tester);
+    await _dismissSystemKeyboard(tester);
+
+    expect(submissions, ['Friday watch party', 'Saturday watch party']);
   });
 }
