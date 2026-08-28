@@ -507,6 +507,19 @@ class AetherBackend implements PlayerBackend {
   @override
   bool get demuxesEmbeddedSubtitles => true;
 
+  // Same engine as the Apple TV backend, so a seek costs the same reopen.
+  // Provisional pending a trace of its own.
+  @override
+  Duration get typicalSeekLatency => const Duration(seconds: 4);
+
+  @override
+  Duration get maxSeekLatency => const Duration(seconds: 20);
+
+  // Same AVPlayer rate path as the Apple TV backend, with the same audio
+  // reconfiguration on every write.
+  @override
+  bool get supportsSmoothRateChange => false;
+
   @override
   List<EmbeddedCaptionTrack> get embeddedCaptionTracks =>
       _embeddedCaptionTracks;

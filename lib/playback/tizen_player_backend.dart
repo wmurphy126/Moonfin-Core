@@ -353,6 +353,11 @@ class TizenPlayerBackend extends PlayerBackend {
   @override
   bool get canRenderBitmapSubtitles => false;
 
+  // The Tizen player does not keep audio going at rates other than 1x, so a
+  // SyncPlay rate nudge would drop the sound for as long as it lasts.
+  @override
+  bool get supportsSmoothRateChange => false;
+
   @override
   void dispose() {
     _isDisposed = true;

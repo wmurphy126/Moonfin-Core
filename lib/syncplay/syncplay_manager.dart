@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:get_it/get_it.dart';
@@ -70,7 +71,13 @@ class SyncPlayManager extends ChangeNotifier {
   /// platforms, so shared speed state cannot be trusted for this.
   bool _speedToSyncApplied = false;
 
+  /// A pause SyncPlay applied to burn off a lead, and the timer that ends it.
+  /// Non-null exactly while the pause is ours to undo: the player's own
+  /// paused state cannot say whose pause it is.
+  Timer? _syncWaitTimer;
+
   StreamSubscription<bool>? _bufferingSub;
+  StreamSubscription<Duration>? _positionSub;
   StreamSubscription<void>? _queueChangedSub;
   bool _applyingRemoteCommand = false;
   final Map<String, String> _itemTitleCache = {};
@@ -89,6 +96,15 @@ class SyncPlayManager extends ChangeNotifier {
   int _lastSyncPositionMs = 0;
   int _lastSyncTimeMs = 0;
   bool _isBuffering = false;
+  /// A Buffering report went out, so the server is holding the group for us
+  /// and is owed a Ready when the stall ends. Without one it is not: the
+  /// server answers an unsolicited Ready with an Unpause echo, and acting on
+  /// that echo seeks the player, which on engines that raise a buffering edge
+  /// for every seek produces another Ready. That cycle is the loop.
+  bool _bufferingReported = false;
+  /// The queue loaded paused for the group's handshake; a Playing state that
+  /// arrives without an Unpause (the server ignoring our wait) starts it.
+  bool _startedPausedForHandshake = false;
   int _suppressBufferingUntilMs = 0;
   Timer? _suppressedBufferingRecheckTimer;
 
@@ -303,7 +319,7 @@ class SyncPlayManager extends ChangeNotifier {
     _lastSyncPositionMs = 0;
     _lastSyncTimeMs = 0;
     _syncCorrection.reset();
-    _restorePlaybackRate();
+    _clearLocalCorrections();
     notifyListeners();
   }
 
@@ -403,23 +419,19 @@ class SyncPlayManager extends ChangeNotifier {
     final pm = _playbackManager;
     // Waiting is a transient handshake state: the server sends an explicit
     // Pause when it wants clients paused, so pausing here would fight the
-    // in-flight Unpause. These calls also shouldn't bounce through the
-    // transport interceptor back into SyncPlay requests.
-    _applyingRemoteCommand = true;
-    try {
-      switch (_state.groupState) {
-        case SyncPlayGroupState.paused:
-          if (pm.state.isPlaying) pm.pause();
-          break;
-        case SyncPlayGroupState.playing:
-          if (!pm.state.isPlaying) pm.resume();
-          break;
-        case SyncPlayGroupState.waiting:
-        case SyncPlayGroupState.idle:
-          break;
-      }
-    } finally {
-      _applyingRemoteCommand = false;
+    // in-flight Unpause.
+    switch (_state.groupState) {
+      case SyncPlayGroupState.paused:
+        if (pm.state.isPlaying) _applyLocalPause();
+        break;
+      case SyncPlayGroupState.playing:
+        // A pause of our own is the group's position being waited for, not a
+        // player that fell out of step.
+        if (!pm.state.isPlaying && _syncWaitTimer == null) _applyLocalResume();
+        break;
+      case SyncPlayGroupState.waiting:
+      case SyncPlayGroupState.idle:
+        break;
     }
   }
 
@@ -494,6 +506,11 @@ class SyncPlayManager extends ChangeNotifier {
       case SyncPlayGroupUpdateType.stateUpdate:
         final payload = update.payload as SyncPlayStateUpdatePayload;
         _state.groupState = payload.update.state;
+        if (_startedPausedForHandshake &&
+            _state.groupState == SyncPlayGroupState.playing) {
+          _startedPausedForHandshake = false;
+          _reconcileLocalPlayback();
+        }
         if (_state.groupState == SyncPlayGroupState.waiting) {
           // Waiting can also be entered on someone else's buffering or an item
           // switch, and the group stays there until we confirm we are ready.
@@ -562,7 +579,14 @@ class SyncPlayManager extends ChangeNotifier {
         ? update.playlist[idx].itemId
         : null;
     final startMs = SyncPlayUtils.ticksToMs(update.startPositionTicks);
-    final shouldAutoPlay = update.isPlaying;
+    // A queue change puts the group into Waiting until every session has
+    // reported Ready, and the Unpause that ends it carries the position the
+    // group is paused at. Playing through that handshake means reporting
+    // Ready from seconds past the group and being dragged back by the Unpause.
+    // So the player starts paused, and the Unpause is what starts it.
+    final shouldAutoPlay =
+        update.isPlaying && _state.groupState == SyncPlayGroupState.playing;
+    _startedPausedForHandshake = update.isPlaying && !shouldAutoPlay;
 
     final localCurrentItemId =
         _itemId(_playbackManager.queueService.currentItem);
@@ -582,17 +606,9 @@ class SyncPlayManager extends ChangeNotifier {
     Timer(const Duration(milliseconds: 750), () {
       if (!_state.enabled) return;
       if (_state.currentPlaylistItemId != targetPlaylistItemId) return;
-      _applyingRemoteCommand = true;
-      try {
-        if (startMs > 0) {
-          _armBufferingSuppression();
-          _playbackManager.seekTo(Duration(milliseconds: startMs));
-        }
-        if (!shouldAutoPlay && _playbackManager.state.isPlaying) {
-          _playbackManager.pause();
-        }
-      } finally {
-        _applyingRemoteCommand = false;
+      if (startMs > 0) _seekPlayer(startMs);
+      if (!shouldAutoPlay && _playbackManager.state.isPlaying) {
+        _applyLocalPause();
       }
     });
   }
@@ -688,10 +704,21 @@ class SyncPlayManager extends ChangeNotifier {
 
     final positionMs =
         _clampedPositionMs(SyncPlayUtils.ticksToMs(command.positionTicks));
+    // The server answers any Ready it gets while already playing with the
+    // sync point it is on, unchanged. That is a confirmation, not a
+    // correction: treating it as a late Unpause and seeking to where the
+    // sync point has got to by now moves a player that was already there,
+    // and on an engine that raises a buffering edge for every seek that
+    // produces another Ready, and another echo.
+    final isEcho = _state.groupState == SyncPlayGroupState.playing &&
+        targetMs == _lastSyncTimeMs &&
+        positionMs == _lastSyncPositionMs;
+    if (isEcho) {
+      _reconcileLocalPlayback();
+      return;
+    }
     _lastSyncPositionMs = positionMs;
     _lastSyncTimeMs = targetMs;
-    // A fresh sync point, so don't inherit a skip streak from before the pause.
-    _syncCorrection.onSyncPointChanged(DateTime.now().millisecondsSinceEpoch);
 
     if (!advancedCorrectionEnabled) {
       if (delayMs > 0) {
@@ -736,8 +763,19 @@ class SyncPlayManager extends ChangeNotifier {
     final positionMs = _clampedPositionMs(adjusted);
     _lastSyncPositionMs = positionMs;
     _lastSyncTimeMs = serverNow;
-    _syncCorrection.onSyncPointChanged(DateTime.now().millisecondsSinceEpoch);
-    _performSeek(positionMs);
+    // The server has moved the group into Waiting: every other client is
+    // paused at the target until all have reported Ready, and the Unpause
+    // that follows carries that same position. A client that keeps playing
+    // through the handshake is dragged back to it by that Unpause, which is
+    // a visible jump backwards on every group seek.
+    _clearLocalCorrections();
+    if (_state.groupState == SyncPlayGroupState.playing &&
+        _playbackManager.state.isPlaying) {
+      _applyLocalPause();
+    }
+    final fromMs = _playbackManager.state.position.inMilliseconds;
+    final issued = _performSeek(positionMs);
+    _openSyncPoint(positionMs, fromMs: fromMs, seekIssued: issued);
     // Seek only ever arrives from the waiting state, which has just flagged
     // every session as buffering. A seek that lands inside the buffer never
     // stalls the pipeline, so waiting on a buffering edge to report Ready
@@ -753,7 +791,7 @@ class SyncPlayManager extends ChangeNotifier {
     } finally {
       _applyingRemoteCommand = false;
     }
-    _restorePlaybackRate();
+    _clearLocalCorrections();
     _scheduledTimer?.cancel();
     _scheduledTimer = null;
     _driftTimer?.cancel();
@@ -766,41 +804,49 @@ class SyncPlayManager extends ChangeNotifier {
   }
 
   void _performResume(int positionMs) {
-    _applyingRemoteCommand = true;
-    try {
-      if (_needsSeek(positionMs)) {
-        _armBufferingSuppression();
-        _playbackManager.seekTo(Duration(milliseconds: positionMs));
-      }
-      if (!_playbackManager.state.isPlaying) {
-        _armBufferingSuppression();
-        _playbackManager.resume();
-      }
-    } finally {
-      _applyingRemoteCommand = false;
+    _clearLocalCorrections();
+    _startedPausedForHandshake = false;
+    final fromMs = _playbackManager.state.position.inMilliseconds;
+    final issued = _performSeek(positionMs);
+    if (!_playbackManager.state.isPlaying) _applyLocalResume();
+    // A fresh sync point, opened at the instant the seek reaches the player
+    // rather than when the command arrived, so the cost measured is the
+    // seek's and not the wait for a scheduled sync point.
+    _openSyncPoint(positionMs, fromMs: fromMs, seekIssued: issued);
+  }
+
+  void _openSyncPoint(
+    int targetMs, {
+    required int fromMs,
+    required bool seekIssued,
+  }) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final settings = _syncCorrectionSettings;
+    if (seekIssued) {
+      _syncCorrection.onSyncPointChanged(
+        nowMs,
+        targetPositionMs: targetMs,
+        fromPositionMs: fromMs,
+        settings: settings,
+      );
+    } else {
+      _syncCorrection.onSyncPointResumed(
+        nowMs,
+        positionMs: fromMs,
+        settings: settings,
+      );
     }
-    _restorePlaybackRate();
-    if (syncCorrectionEnabled) _scheduleDriftCorrection();
   }
 
   void _performPause(int positionMs) {
-    _restorePlaybackRate();
-    _applyingRemoteCommand = true;
-    try {
-      _playbackManager.pause();
-      if (_needsSeek(positionMs)) {
-        _armBufferingSuppression();
-        _playbackManager.seekTo(Duration(milliseconds: positionMs));
-      }
-    } finally {
-      _applyingRemoteCommand = false;
-    }
+    _applyLocalPause();
+    if (_needsSeek(positionMs)) _seekPlayer(positionMs);
   }
 
   /// Pauses the player without routing back through the interceptor, for the
   /// cases where the group has no command to send us.
   void _applyLocalPause() {
-    _restorePlaybackRate();
+    _clearLocalCorrections();
     _applyingRemoteCommand = true;
     try {
       _playbackManager.pause();
@@ -809,20 +855,41 @@ class SyncPlayManager extends ChangeNotifier {
     }
   }
 
-  void _performSeek(int positionMs) {
-    if (_needsSeek(positionMs)) {
-      _applyingRemoteCommand = true;
-      try {
-        _armBufferingSuppression();
-        _playbackManager.seekTo(Duration(milliseconds: positionMs));
-      } finally {
-        _applyingRemoteCommand = false;
-      }
+  /// The counterpart of [_applyLocalPause]: starts the player where it is
+  /// without asking the group for an Unpause.
+  void _applyLocalResume() {
+    _applyingRemoteCommand = true;
+    try {
+      _armBufferingSuppression();
+      _playbackManager.resume();
+    } finally {
+      _applyingRemoteCommand = false;
     }
+  }
+
+  /// Every seek SyncPlay itself issues goes through here, so the buffering
+  /// edge the seek raises is never mistaken for a stall to report.
+  void _seekPlayer(int positionMs) {
+    _applyingRemoteCommand = true;
+    try {
+      _armBufferingSuppression(forSeek: true);
+      _playbackManager.seekTo(Duration(milliseconds: positionMs));
+    } finally {
+      _applyingRemoteCommand = false;
+    }
+  }
+
+  /// Returns whether the seek was actually issued. A target already inside
+  /// [_seekToleranceMs] never reaches the player, and a correction that moved
+  /// nothing must not be waited on or scored as a failure.
+  bool _performSeek(int positionMs) {
+    final issued = _needsSeek(positionMs);
+    if (issued) _seekPlayer(positionMs);
     if (syncCorrectionEnabled &&
         _state.groupState == SyncPlayGroupState.playing) {
       _scheduleDriftCorrection();
     }
+    return issued;
   }
 
   bool _needsSeek(int targetMs) {
@@ -830,9 +897,20 @@ class SyncPlayManager extends ChangeNotifier {
     return (currentMs - targetMs).abs() > _seekToleranceMs;
   }
 
-  void _armBufferingSuppression() {
+  /// [forSeek] widens the window to the backend's own worst-case seek cost. A
+  /// seek that outlasts the short window is not a stall to report: reporting
+  /// it pauses the whole group for the seek, and on a player that seeks slowly
+  /// that is every corrective skip.
+  void _armBufferingSuppression({bool forSeek = false}) {
+    final windowMs = forSeek
+        ? math.max(
+            _bufferingSuppressionMs,
+            _playbackManager.backend?.maxSeekLatency.inMilliseconds ??
+                SyncCorrectionPolicy.maxSeekLatencyAllowanceMs,
+          )
+        : _bufferingSuppressionMs;
     _suppressBufferingUntilMs =
-        DateTime.now().millisecondsSinceEpoch + _bufferingSuppressionMs;
+        DateTime.now().millisecondsSinceEpoch + windowMs;
   }
 
   int _clampedPositionMs(int value) {
@@ -862,6 +940,34 @@ class SyncPlayManager extends ChangeNotifier {
     _playbackManager.setPlaybackSpeed(speed);
   }
 
+  /// Holds the player paused for [durationMs] to let the group catch up. It
+  /// is exact where a rate nudge is approximate, and it needs neither a seek
+  /// nor a rate write, which on the Apple TV engine are the two things that
+  /// glitch. The pause never reaches the group, and only [_stopSyncWait] or
+  /// the timer undoes it.
+  void _applySyncWait(int durationMs) {
+    _applyLocalPause();
+    _syncWaitTimer = Timer(Duration(milliseconds: durationMs), () {
+      _syncWaitTimer = null;
+      if (_state.groupState == SyncPlayGroupState.playing) _applyLocalResume();
+      _scheduleDriftCorrection();
+    });
+  }
+
+  /// Cancels a wait SyncPlay applied. The player is left paused: every caller
+  /// is about to pause, stop or resume it itself.
+  void _stopSyncWait() {
+    _syncWaitTimer?.cancel();
+    _syncWaitTimer = null;
+  }
+
+  /// Everything SyncPlay may have applied to the player on its own: a rate
+  /// nudge or a wait. Called before any group command takes over.
+  void _clearLocalCorrections() {
+    _restorePlaybackRate();
+    _stopSyncWait();
+  }
+
   void _scheduleAction(int delayMs, void Function() action) {
     _scheduledTimer?.cancel();
     _scheduledTimer = Timer(Duration(milliseconds: delayMs < 0 ? 0 : delayMs), action);
@@ -876,33 +982,57 @@ class SyncPlayManager extends ChangeNotifier {
     _driftTimer = Timer(const Duration(seconds: 2), _performDriftCorrection);
   }
 
-  SyncCorrectionSettings get _syncCorrectionSettings => SyncCorrectionSettings(
-        useSkipToSync: useSkipToSync,
-        useSpeedToSync: useSpeedToSync,
-        minDelaySkipToSyncMs: minDelaySkipToSync,
-        minDelaySpeedToSyncMs: minDelaySpeedToSync,
-        maxDelaySpeedToSyncMs: maxDelaySpeedToSync,
-        speedToSyncDurationMs: speedToSyncDuration,
-        extraTimeOffsetMs: extraTimeOffset,
-      );
+  SyncCorrectionSettings get _syncCorrectionSettings {
+    // How slowly this player seeks is the difference between a correction that
+    // converges and one that lands short every time, so it is read from the
+    // backend rather than assumed. Null only before a player exists, where the
+    // desktop-shaped defaults are the safe answer.
+    final backend = _playbackManager.backend;
+    return SyncCorrectionSettings(
+      useSkipToSync: useSkipToSync,
+      // A rate nudge on a player whose audio does not survive one is worse
+      // than the drift it corrects, whatever the preference says.
+      useSpeedToSync:
+          useSpeedToSync && (backend?.supportsSmoothRateChange ?? true),
+      minDelaySkipToSyncMs: minDelaySkipToSync,
+      minDelaySpeedToSyncMs: minDelaySpeedToSync,
+      maxDelaySpeedToSyncMs: maxDelaySpeedToSync,
+      speedToSyncDurationMs: speedToSyncDuration,
+      extraTimeOffsetMs: extraTimeOffset,
+      typicalSeekLatencyMs: backend?.typicalSeekLatency.inMilliseconds ??
+          SyncCorrectionPolicy.defaultTypicalSeekLatencyMs,
+      maxSeekLatencyMs: backend?.maxSeekLatency.inMilliseconds ??
+          SyncCorrectionPolicy.maxSeekLatencyAllowanceMs,
+    );
+  }
 
   void _performDriftCorrection() {
     final tsm = _timeSync;
     if (tsm == null ||
         _state.groupState != SyncPlayGroupState.playing ||
         _lastSyncTimeMs == 0 ||
-        _syncCorrection.hasGivenUp) {
+        _syncCorrection.hasGivenUp ||
+        // Measuring a player we are holding paused would read as far behind.
+        // The wait's own timer resumes the ticks.
+        _syncWaitTimer != null) {
       return;
     }
     final pm = _playbackManager;
+    // Sampled once so the log below describes the same instant the policy
+    // judged, rather than a clock read a few milliseconds later.
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final serverNowMs = tsm.getServerTimeNow();
+    final positionMs = pm.state.position.inMilliseconds;
+    final isBuffering = pm.state.isBuffering || _isBuffering;
+    final isPlaying = pm.state.isPlaying;
     final decision = _syncCorrection.evaluate(
-      nowMs: DateTime.now().millisecondsSinceEpoch,
-      serverNowMs: tsm.getServerTimeNow(),
-      currentPositionMs: pm.state.position.inMilliseconds,
+      nowMs: nowMs,
+      serverNowMs: serverNowMs,
+      currentPositionMs: positionMs,
       lastSyncPositionMs: _lastSyncPositionMs,
       lastSyncTimeMs: _lastSyncTimeMs,
-      isBuffering: pm.state.isBuffering || _isBuffering,
-      isPlaying: pm.state.isPlaying,
+      isBuffering: isBuffering,
+      isPlaying: isPlaying,
       clockJitterMs: tsm.offsetJitterMs,
       settings: _syncCorrectionSettings,
     );
@@ -911,16 +1041,18 @@ class SyncPlayManager extends ChangeNotifier {
       // Leaves the rate alone: the pipeline is stalled or paused here.
       case SyncCorrectionAction.defer:
         _scheduleDriftCorrection();
-      // Absorbs the seek's own cost so it is never mistaken for drift.
-      case SyncCorrectionAction.rebaseline:
-        _lastSyncPositionMs += decision.measuredDelayMs;
-        _scheduleDriftCorrection();
       case SyncCorrectionAction.hold:
-        _restorePlaybackRate();
+        _clearLocalCorrections();
         _scheduleDriftCorrection();
+      case SyncCorrectionAction.wait:
+        _applySyncWait(decision.waitDurationMs);
       case SyncCorrectionAction.skip:
-        _restorePlaybackRate();
-        _performSeek(_clampedPositionMs(decision.targetPositionMs));
+        _clearLocalCorrections();
+        final clamped = _clampedPositionMs(decision.targetPositionMs);
+        // A target inside _seekToleranceMs never reaches the player, so the
+        // policy has to take back the skip it already counted rather than wait
+        // out a settle window for a seek that did not happen.
+        if (!_performSeek(clamped)) _syncCorrection.onSkipDropped();
         _scheduleDriftCorrection();
       case SyncCorrectionAction.speed:
         _applyPlaybackRate(decision.speed);
@@ -936,9 +1068,9 @@ class SyncPlayManager extends ChangeNotifier {
         _restorePlaybackRate();
         _logger.w(
           'SyncPlay: sync correction disabled for this item after '
-          '${_syncCorrection.consecutiveSkips} skips failed to converge '
-          '(residual ${decision.measuredDelayMs}ms, latency allowance '
-          '${_syncCorrection.seekLatencyAllowanceMs}ms)',
+          '${_syncCorrection.skipsUsed} skips failed to converge, leaving '
+          'the client ${decision.measuredDelayMs}ms from the group '
+          '(latency allowance ${_syncCorrection.seekLatencyAllowanceMs}ms)',
         );
     }
   }
@@ -948,6 +1080,17 @@ class SyncPlayManager extends ChangeNotifier {
     if (_bufferingSub != null) return;
     final pm = _playbackManager;
     _bufferingSub = pm.state.bufferingStream.listen(_onBuffering);
+    // Every position sample goes to the policy so a seek's landing is timed at
+    // the backend's resolution, not the 2s correction tick. A cost quantised
+    // to 2s over-aims the next skip by up to that much.
+    _positionSub = pm.state.positionStream.listen((position) {
+      _syncCorrection.observe(
+        nowMs: DateTime.now().millisecondsSinceEpoch,
+        positionMs: position.inMilliseconds,
+        isPlaying: pm.state.isPlaying,
+        isBuffering: pm.state.isBuffering,
+      );
+    });
     _queueChangedSub ??= pm.queueService.queueChangedStream
         .listen((_) => _onLocalQueueChanged());
     pm.setTransportInterceptor(_interceptTransport);
@@ -956,6 +1099,8 @@ class SyncPlayManager extends ChangeNotifier {
   void _stopPlaybackObservers() {
     _bufferingSub?.cancel();
     _bufferingSub = null;
+    _positionSub?.cancel();
+    _positionSub = null;
     _queueChangedSub?.cancel();
     _queueChangedSub = null;
     _bufferingTimer?.cancel();
@@ -968,12 +1113,13 @@ class SyncPlayManager extends ChangeNotifier {
     _pendingSeekTarget = null;
     _queueSyncDebounceTimer?.cancel();
     _queueSyncDebounceTimer = null;
-    _speedToSyncTimer?.cancel();
-    _speedToSyncTimer = null;
+    _clearLocalCorrections();
     _suppressedBufferingRecheckTimer?.cancel();
     _suppressedBufferingRecheckTimer = null;
     _suppressBufferingUntilMs = 0;
     _isBuffering = false;
+    _bufferingReported = false;
+    _startedPausedForHandshake = false;
     _playbackManager.setTransportInterceptor(null);
   }
 
@@ -1060,9 +1206,14 @@ class SyncPlayManager extends ChangeNotifier {
       _suppressedBufferingRecheckTimer?.cancel();
       _suppressedBufferingRecheckTimer = null;
       // A pending report for a blip that already recovered shouldn't fire.
-      // The Ready report is never suppressed because the server waits on it.
       _bufferingTimer?.cancel();
-      _queueReadyReport();
+      // Ready answers a wait. A stall the server never heard about (our own
+      // seek, inside its suppression window) owes it nothing, and reporting
+      // anyway is what starts the Ready/Unpause/seek cycle.
+      if (_bufferingReported ||
+          _state.groupState == SyncPlayGroupState.waiting) {
+        _queueReadyReport();
+      }
     }
   }
 
@@ -1203,6 +1354,7 @@ class SyncPlayManager extends ChangeNotifier {
           positionTicks: positionTicks,
           when: _serverWhen(),
         );
+        _bufferingReported = true;
         return;
       } catch (_) {
         if (attempt == _maxHandshakeRetries - 1) return;
@@ -1236,6 +1388,7 @@ class SyncPlayManager extends ChangeNotifier {
           positionTicks: positionTicks,
           when: _serverWhen(),
         );
+        _bufferingReported = false;
         return;
       } catch (_) {
         if (attempt == _maxHandshakeRetries - 1) return;

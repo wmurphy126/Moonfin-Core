@@ -787,6 +787,25 @@ class AppleTvBackend implements PlayerBackend {
   @override
   bool get demuxesEmbeddedSubtitles => true;
 
+  // Every seek here goes through `.seeking`, which the wrapper reports as
+  // buffering with no in-buffer fast path, and one that restarts a transcode
+  // has to open the session again before a frame is rendered. Provisional
+  // until a device trace measures the real distribution; SyncPlay measures
+  // each seek anyway and only uses these to pace itself and to decide when a
+  // gap has stopped being seek cost.
+  @override
+  Duration get typicalSeekLatency => const Duration(seconds: 4);
+
+  @override
+  Duration get maxSeekLatency => const Duration(seconds: 20);
+
+  // A rate write goes straight to the engine's AVPlayer rate. Every one of
+  // them audibly reconfigures the audio, and passthrough audio cannot play at
+  // anything but 1x, so a SyncPlay nudge every two seconds is a stutter that
+  // never stops.
+  @override
+  bool get supportsSmoothRateChange => false;
+
   @override
   List<EmbeddedCaptionTrack> get embeddedCaptionTracks =>
       _embeddedCaptionTracks;
