@@ -1417,6 +1417,15 @@ class _AppleTvPlayerHostScreenState extends State<AppleTvPlayerHostScreen> {
           _prompts?.onUserSeeked();
         }
       case 'userSeeked':
+        // The native player has already seeked itself; the manager is told
+        // so that whatever coordinates playback (SyncPlay's group seek) hears
+        // about it without the player being moved a second time.
+        final seekedToMs = (action['positionMs'] as num?)?.toInt();
+        if (seekedToMs != null) {
+          unawaited(
+            manager.notifyExternalSeek(Duration(milliseconds: seekedToMs)),
+          );
+        }
         _prompts?.onUserSeeked();
       case 'nextUpPlay':
         unawaited(_prompts?.handleNextUpPlay() ?? Future<void>.value());
