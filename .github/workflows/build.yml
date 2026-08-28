@@ -44,6 +44,7 @@ permissions:
 
 env:
   FLUTTER_VERSION: '3.44.1'
+  EXPECTED_WINDOWS_VERSION: '2.5.13'
 
 jobs:
   # Android APK + AAB
@@ -245,12 +246,24 @@ jobs:
       - name: Verify Windows artifact
         shell: pwsh
         run: |
-          $artifacts = Get-ChildItem -Path . -Filter "Moonfin_Windows_v*.exe" -File -ErrorAction SilentlyContinue
-          if (-not $artifacts -or $artifacts.Count -eq 0) {
-            throw "Windows build did not produce Moonfin_Windows_v*.exe"
+          $expectedInstaller = "Moonfin_Windows_v$env:EXPECTED_WINDOWS_VERSION.exe"
+          $installer = Get-Item -LiteralPath $expectedInstaller -ErrorAction SilentlyContinue
+          if (-not $installer) {
+            throw "Windows build did not produce expected installer $expectedInstaller"
           }
-          Write-Host "Found Windows artifact(s):"
-          $artifacts | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+          $app = Get-Item -LiteralPath "build\windows\x64\runner\Release\moonfin.exe" -ErrorAction SilentlyContinue
+          if (-not $app) {
+            throw "Windows build did not produce moonfin.exe"
+          }
+
+          $productVersion = $app.VersionInfo.ProductVersion
+          if ($productVersion -notlike "$env:EXPECTED_WINDOWS_VERSION*") {
+            throw "moonfin.exe product version $productVersion does not match expected $env:EXPECTED_WINDOWS_VERSION"
+          }
+
+          Write-Host "Verified installer: $($installer.Name)"
+          Write-Host "Verified moonfin.exe product version: $productVersion"
 
       - uses: actions/upload-artifact@v4
         id: unsigned-windows
