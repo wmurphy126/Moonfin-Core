@@ -36,7 +36,10 @@ final class AppleTvPlayerViewController: UIViewController {
     var onNextUpCancel: (() -> Void)?
     var onNextUpDismiss: (() -> Void)?
     var onSkipSegmentSelect: (() -> Void)?
-    var onUserSeek: (() -> Void)?
+    /// Fires with the target after a scrub or a direct jump the user made.
+    /// Carrying the position lets the host hand it to SyncPlay, which is the
+    /// only way a seek made on this player reaches the rest of the group.
+    var onUserSeek: ((Int) -> Void)?
     var onSearchSubtitles: (() -> Void)?
     var onSubtitleDelayChanged: ((Int) -> Void)?
     var onDownloadSubtitle: ((String) -> Void)?
@@ -1970,7 +1973,7 @@ final class AppleTvPlayerViewController: UIViewController {
         scrubCommitId += 1
         let commitId = scrubCommitId
         player.seek(to: Double(target) / 1000.0)
-        onUserSeek?()
+        onUserSeek?(target)
         renderProgress()
         updateTrickplay()
         scrubConvergeDeadline = ProcessInfo.processInfo.systemUptime + 2.0
@@ -2030,7 +2033,7 @@ final class AppleTvPlayerViewController: UIViewController {
         let durationMs = Int(player.duration * 1000)
         let clamped = durationMs > 0 ? min(durationMs, max(0, ms)) : max(0, ms)
         player.seek(to: Double(clamped) / 1000.0)
-        onUserSeek?()
+        onUserSeek?(clamped)
     }
 
     func seekFromHost(toSeconds seconds: TimeInterval) {

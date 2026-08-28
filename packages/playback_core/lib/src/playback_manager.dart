@@ -2044,6 +2044,15 @@ class PlaybackManager implements AudioOwnable {
     await _backend?.seekTo(position);
   }
 
+  /// A seek the player performed on its own, from a control the manager does
+  /// not own (the native tvOS transport). The player has already moved, so
+  /// only the interceptor sees it: whoever is coordinating playback, if
+  /// anyone, gets the same notice a [seekTo] would have given.
+  Future<void> notifyExternalSeek(Duration position) async {
+    _lastKnownPosition = position;
+    await _maybeIntercept(TransportAction.seek, position: position);
+  }
+
   Future<void> setPlaybackSpeed(double speed) async {
     await _backend?.setPlaybackSpeed(speed);
     state.setPlaybackSpeed(speed);
