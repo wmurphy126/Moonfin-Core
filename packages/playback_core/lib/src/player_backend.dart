@@ -149,5 +149,25 @@ abstract class PlayerBackend {
   /// stream started has to be rebuilt when this fires.
   Stream<void> get tracksChangedStream => const Stream.empty();
 
+  /// How long this player usually takes to render again after a seek. Only
+  /// paces how often SyncPlay may correct: the cost it actually compensates
+  /// for is measured from the player, never taken from here.
+  Duration get typicalSeekLatency => const Duration(milliseconds: 1500);
+
+  /// The longest a seek on this player may plausibly take. SyncPlay treats a
+  /// gap larger than this as the client being genuinely late rather than as
+  /// the seek still landing, and stops waiting on a seek that exceeds it.
+  /// Backends that restart a transcode to seek need this much higher than the
+  /// in-buffer seek a desktop player does.
+  Duration get maxSeekLatency => const Duration(seconds: 8);
+
+  /// Whether the rate can be changed a few percent mid-playback without the
+  /// audio dropping or glitching. mpv and ExoPlayer stretch audio in place;
+  /// the AVPlayer-based engines rebuild the audio pipeline on every rate write
+  /// and cannot pass Dolby audio through at anything but 1x. SyncPlay only
+  /// nudges the rate where this is true, and holds the player instead where
+  /// it is not.
+  bool get supportsSmoothRateChange => true;
+
   void dispose();
 }

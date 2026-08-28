@@ -131,6 +131,13 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
             } else {
                 player?.seek(to: ms(args["positionMs"]))
             }
+            // State is otherwise only pushed by the 0.25s timer, so until the
+            // next tick Dart still reads the pre-seek position with the player
+            // reported as playing. Anything measuring how far behind we are
+            // takes that sample as real and corrects against a position the
+            // seek has already left. Android emits on the same discontinuity
+            // for the same reason (Media3VideoView.onPositionDiscontinuity).
+            markSeekInFlight()
         case "setSpeed":
             player?.setRate((args["speed"] as? NSNumber)?.floatValue ?? 1.0)
         case "setAudioTrack":
@@ -274,8 +281,8 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
         vc.onSkipSegmentSelect = { [weak self] in
             self?.send(["event": "skipSegment"])
         }
-        vc.onUserSeek = { [weak self] in
-            self?.send(["event": "userSeeked"])
+        vc.onUserSeek = { [weak self] positionMs in
+            self?.send(["event": "userSeeked", "positionMs": positionMs])
         }
         vc.onSearchSubtitles = { [weak self] in
             self?.send(["event": "searchSubtitles"])
@@ -411,6 +418,26 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
         stateTimer = nil
     }
 
+    /// Reports the seek immediately rather than waiting for the next timer
+    /// tick. The engine has not moved its clock yet, so the position is still
+    /// the old one; what matters is that it goes out flagged as buffering, so
+    /// nothing downstream mistakes it for a settled measurement.
+    private func markSeekInFlight() {
+        guard let p = player else { return }
+        send(statePayload(p, isPlaying: false, isBuffering: true))
+    }
+
+    private func statePayload(_ p: AetherPlayerWrapper, isPlaying: Bool, isBuffering: Bool) -> [String: Any] {
+        [
+            "event": "state",
+            "positionMs": Int((p.currentTime * 1000).rounded()),
+            "durationMs": Int((p.duration * 1000).rounded()),
+            "bufferedMs": Int((p.duration * Double(p.bufferProgress) * 1000).rounded()),
+            "isPlaying": isPlaying,
+            "isBuffering": isBuffering,
+        ]
+    }
+
     private func pushState() {
         guard let p = player else { return }
         if p.state != lastLoggedState {
@@ -430,14 +457,7 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
             break
         }
 
-        send([
-            "event": "state",
-            "positionMs": Int((p.currentTime * 1000).rounded()),
-            "durationMs": Int((p.duration * 1000).rounded()),
-            "bufferedMs": Int((p.duration * Double(p.bufferProgress) * 1000).rounded()),
-            "isPlaying": isPlaying,
-            "isBuffering": isBuffering,
-        ])
+        send(statePayload(p, isPlaying: isPlaying, isBuffering: isBuffering))
 
         // Captions can turn up part way through a live stream, so a change in
         // either list re-emits tracksChanged.
