@@ -1,0 +1,69 @@
+name: Build Remote Search Android Test
+
+on:
+  push:
+    branches: [test/remote-search-android]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MOONFIN_TEST_ID_SUFFIX: .remotesearch
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.2'
+      - name: Configure a separate mobile test application
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('android/app/build.gradle.kts')
+          source = path.read_text()
+          old = '''        create("mobile") {
+                      dimension = "device"
+                      applicationId = baseAppId'''
+          new = old.replace('applicationId = baseAppId', 'applicationId = baseAppId + testIdSuffix')
+          if source.count(old) != 1:
+              raise SystemExit('Mobile flavor changed; refusing an ambiguous packaging edit')
+          source = source.replace(old, new, 1)
+          source = source.replace('manifestPlaceholders["appName"] = baseAppName',
+                                  'manifestPlaceholders["appName"] = "Moonfin Search Test"', 1)
+          path.write_text(source)
+          PY
+      - name: Resolve dependencies and check remote controls
+        run: |
+          flutter pub get
+          flutter test test/data/services/remote_search_test.dart test/data/services/remote_search_transport_test.dart test/ui/widgets/remote_search_sheet_test.dart test/ui/widgets/remote_search_dialog_test.dart test/auth/session_remote_command_test.dart test/data/services/websocket_playstate_parser_test.dart
+      - name: Build universal mobile release APK
+        run: flutter build apk --release --flavor mobile --dart-define=DISTRIBUTION_CHANNEL=apk
+      - name: Verify and collect APK
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          APK=build/app/outputs/flutter-apk/app-mobile-release.apk
+          TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          "$TOOLS/apksigner" verify --verbose "$APK"
+          "$TOOLS/aapt" dump badging "$APK" > artifacts/apk-info.txt
+          grep -q "package: name='org.moonfin.androidtv.remotesearch'" artifacts/apk-info.txt
+          grep -q "application-label:'Moonfin Search Test'" artifacts/apk-info.txt
+          cp "$APK" artifacts/Moonfin-Remote-Search-Android.apk
+          cd artifacts
+          sha256sum Moonfin-Remote-Search-Android.apk > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moonfin-remote-search-android
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
