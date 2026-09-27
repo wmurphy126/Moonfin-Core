@@ -113,6 +113,8 @@ class AppleTvBackend implements PlayerBackend {
 
   Future<void> dismissPlayer() => _dismissPlayer();
 
+  bool get isPlayerPresented => _playerPresented;
+
   void _handleEvent(dynamic event) {
     if (_disposed || event is! Map) return;
     final map = event.map((k, v) => MapEntry(k.toString(), v));

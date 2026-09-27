@@ -1,5 +1,10 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
+import 'package:go_router/go_router.dart';
 import 'package:jellyfin_preference/jellyfin_preference.dart';
 import 'package:playback_core/playback_core.dart';
 import 'package:server_core/server_core.dart';
@@ -15,7 +20,12 @@ import 'package:moonfin/data/services/download_notification_service.dart';
 import 'package:moonfin/data/services/media_server_client_factory.dart';
 import 'package:moonfin/data/services/plugin_sync_service.dart';
 import 'package:moonfin/data/services/socket_handler.dart';
+import 'package:moonfin/data/services/remote_search_session.dart';
+import 'package:moonfin/playback/appletv_backend.dart';
 import 'package:moonfin/preference/user_preferences.dart';
+import 'package:moonfin/ui/navigation/app_router.dart';
+import 'package:moonfin/ui/navigation/destinations.dart';
+import 'package:moonfin/util/platform_detection.dart';
 
 /// The command handlers never reach the collaborators the repository is built
 /// from, so these stay empty on purpose.
@@ -35,6 +45,14 @@ class _FakeUserRepository extends Fake implements UserRepository {}
 
 class _FakePluginSyncService extends Fake implements PluginSyncService {}
 
+class _AppleTvBackend extends Fake implements AppleTvBackend {
+  bool dismissed = false;
+  @override
+  bool get isPlayerPresented => !dismissed;
+  @override
+  Future<void> dismissPlayer() async => dismissed = true;
+}
+
 class _FakeNotifications extends Fake implements DownloadNotificationService {
   final List<String> messages = [];
 
@@ -52,12 +70,13 @@ class _RecordingManager extends Fake implements PlaybackManager {
 
   double trackedVolume = 100;
   bool trackedMuted = false;
+  Completer<void>? stopBarrier;
 
   @override
   final PlayerState state = PlayerState();
 
   @override
-  PlayerBackend? get backend => null;
+  PlayerBackend? backend;
 
   @override
   double get volume => trackedVolume;
@@ -81,7 +100,10 @@ class _RecordingManager extends Fake implements PlaybackManager {
   Future<void> previous() async => calls.add('previous');
 
   @override
-  Future<void> stop({bool userInitiated = true}) async => calls.add('stop');
+  Future<void> stop({bool userInitiated = true}) async {
+    calls.add('stop');
+    await stopBarrier?.future;
+  }
 
   @override
   Future<void> seekTo(Duration position) async {
@@ -123,17 +145,257 @@ void main() {
     );
   });
 
-  tearDown(() => GetIt.instance.reset());
+  tearDown(() async {
+    PlatformDetection.setTvMode(false);
+    await GetIt.instance.reset();
+  });
 
   Future<void> send(String command, {int? seekTicks}) =>
       repository.handleRemoteCommandForTest(
         PlaystateMessage(command: command, seekPositionTicks: seekTicks),
       );
 
-  Future<void> sendGeneral(String name, {Map<String, String> args = const {}}) =>
-      repository.handleRemoteCommandForTest(
-        GeneralCommandMessage(name: name, arguments: args),
+  Future<void> sendGeneral(
+    String name, {
+    Map<String, String> args = const {},
+  }) => repository.handleRemoteCommandForTest(
+    GeneralCommandMessage(name: name, arguments: args),
+  );
+
+  testWidgets(
+    'TV commands reach custom focus handlers without held hardware keys',
+    (tester) async {
+      PlatformDetection.setTvMode(true);
+      final keys = <LogicalKeyboardKey>[];
+      final releases = <LogicalKeyboardKey>[];
+      final hardwareKeys = {...HardwareKeyboard.instance.logicalKeysPressed};
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Focus(
+            autofocus: true,
+            onKeyEvent: (node, event) {
+              if (event is KeyDownEvent) keys.add(event.logicalKey);
+              if (event is KeyUpEvent) releases.add(event.logicalKey);
+              return KeyEventResult.handled;
+            },
+            child: const SizedBox(),
+          ),
+        ),
       );
+      await tester.pump();
+      for (final name in [
+        'MoveUp',
+        'MoveDown',
+        'MoveLeft',
+        'MoveRight',
+        'Select',
+        'Back',
+      ]) {
+        await sendGeneral(name);
+      }
+      expect(keys, [
+        LogicalKeyboardKey.arrowUp,
+        LogicalKeyboardKey.arrowDown,
+        LogicalKeyboardKey.arrowLeft,
+        LogicalKeyboardKey.arrowRight,
+        LogicalKeyboardKey.select,
+        LogicalKeyboardKey.escape,
+      ]);
+      expect(releases, keys);
+      expect(HardwareKeyboard.instance.logicalKeysPressed, hardwareKeys);
+    },
+  );
+
+  testWidgets('TV navigation falls back to traversal and button activation', (
+    tester,
+  ) async {
+    PlatformDetection.setTvMode(true);
+    final first = FocusNode();
+    final second = FocusNode();
+    addTearDown(first.dispose);
+    addTearDown(second.dispose);
+    var selected = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Row(
+          children: [
+            TextButton(
+              focusNode: first,
+              autofocus: true,
+              onPressed: () {},
+              child: const Text('First'),
+            ),
+            TextButton(
+              focusNode: second,
+              onPressed: () => selected++,
+              child: const Text('Second'),
+            ),
+          ],
+        ),
+      ),
+    );
+    await tester.pump();
+    await sendGeneral('MoveRight');
+    await tester.pump();
+    expect(second.hasFocus, isTrue);
+    await sendGeneral('Select');
+    await tester.pump();
+    expect(selected, 1);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('native playback cannot activate hidden Flutter controls', (
+    tester,
+  ) async {
+    PlatformDetection.setTvMode(true);
+    final backend = _AppleTvBackend();
+    manager.backend = backend;
+    var selected = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TextButton(
+          autofocus: true,
+          onPressed: () => selected++,
+          child: const Text('Hidden'),
+        ),
+      ),
+    );
+    await tester.pump();
+    await sendGeneral('MoveDown');
+    await sendGeneral('Select');
+    expect(selected, 0);
+    await sendGeneral('Back');
+    expect(manager.calls, ['stop']);
+    expect(backend.dismissed, isTrue);
+  });
+
+  test('Home stops playback and dismisses its native presentation', () async {
+    final backend = _AppleTvBackend();
+    manager.backend = backend;
+    appRouter.go(Destinations.search);
+    manager.stopBarrier = Completer<void>();
+    final home = sendGeneral('GoHome');
+    expect(backend.dismissed, isFalse);
+    manager.stopBarrier!.complete();
+    await home;
+    expect(manager.calls, ['stop']);
+    expect(backend.dismissed, isTrue);
+    expect(
+      appRouter.routeInformationProvider.value.uri.path,
+      Destinations.home,
+    );
+  });
+
+  testWidgets('Back closes the top dialog before navigating the TV page', (
+    tester,
+  ) async {
+    PlatformDetection.setTvMode(true);
+    await tester.pumpWidget(
+      MaterialApp(
+        navigatorKey: appRouter.routerDelegate.navigatorKey,
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showDialog<void>(
+                context: context,
+                builder: (_) => const AlertDialog(content: Text('Options')),
+              ),
+              child: const Text('Open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Open'));
+    await tester.pumpAndSettle();
+    expect(find.text('Options'), findsOneWidget);
+    await sendGeneral('Back');
+    await tester.pumpAndSettle();
+    expect(find.text('Options'), findsNothing);
+    expect(find.text('Open'), findsOneWidget);
+  });
+
+  group('remote search navigation', () {
+    setUp(() => appRouter.go(Destinations.startup));
+
+    test('buffers text while stopping playback and dismisses the native Apple TV player', () async {
+      final backend = _AppleTvBackend();
+      manager.backend = backend;
+      manager.stopBarrier = Completer<void>();
+      final opening = sendGeneral(
+        'GoToSearch',
+        args: {'MoonfinInputId': 'phone'},
+      );
+      await sendGeneral(
+        'SendString',
+        args: {
+          'String': 'alien',
+          'MoonfinInputId': 'phone',
+          'MoonfinRevision': '1',
+        },
+      );
+      expect(backend.dismissed, isFalse);
+      manager.stopBarrier!.complete();
+      await opening;
+      expect(backend.dismissed, isTrue);
+      expect(manager.calls, ['stop']);
+      expect(
+        appRouter.routeInformationProvider.value.uri.path,
+        Destinations.search,
+      );
+      final route =
+          appRouter.routeInformationProvider.value.state
+              as RouteInformationState;
+      final search = route.extra as RemoteSearchSession;
+      final values = <String>[];
+      search.attach(values.add);
+      expect(values, ['alien']);
+      search.close();
+    });
+
+    test('back cancels a search still waiting for playback to stop', () async {
+      manager.stopBarrier = Completer<void>();
+      final opening = sendGeneral('GoToSearch');
+      await sendGeneral('Back');
+      manager.stopBarrier!.complete();
+      await opening;
+      expect(
+        appRouter.routeInformationProvider.value.uri.path,
+        Destinations.startup,
+      );
+    });
+
+    test('a second search supersedes the first and its delayed text', () async {
+      manager.stopBarrier = Completer<void>();
+      final first = sendGeneral('GoToSearch', args: {'MoonfinInputId': 'old'});
+      final second = sendGeneral('GoToSearch', args: {'MoonfinInputId': 'new'});
+      await sendGeneral(
+        'SendString',
+        args: {
+          'String': 'stale',
+          'MoonfinInputId': 'old',
+          'MoonfinRevision': '9',
+        },
+      );
+      await sendGeneral(
+        'SendString',
+        args: {
+          'String': 'latest',
+          'MoonfinInputId': 'new',
+          'MoonfinRevision': '1',
+        },
+      );
+      manager.stopBarrier!.complete();
+      await Future.wait([first, second]);
+      final route =
+          appRouter.routeInformationProvider.value.state
+              as RouteInformationState;
+      final search = route.extra as RemoteSearchSession;
+      expect(search.inputId, 'new');
+      expect(search.text, 'latest');
+      search.close();
+    });
+  });
 
   group('play and pause', () {
     test('PlayPause pauses what is playing', () async {
