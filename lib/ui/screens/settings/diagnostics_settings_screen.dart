@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart';
 import 'package:get_it/get_it.dart';
 import 'package:moonfin_design/moonfin_design.dart';
 
 import '../../../data/services/log_service.dart';
 import '../../../data/services/performance_recorder.dart';
+import '../../../data/services/performance_report_upload.dart';
 import '../../../preference/user_preferences.dart';
 import '../../../util/artwork_timing.dart';
 import '../../../util/focus/dpad_keys.dart';
@@ -28,6 +30,7 @@ class _DiagnosticsSettingsScreenState extends State<DiagnosticsSettingsScreen> {
   LogService get _log => GetIt.instance<LogService>();
 
   bool _uploading = false;
+  String? _performanceUploadProgress;
   final _performance = PerformanceRecorder.instance;
   LogCategory? _filter;
 
@@ -36,10 +39,15 @@ class _DiagnosticsSettingsScreenState extends State<DiagnosticsSettingsScreen> {
     try {
       final report = await _performance.report();
       if (report == null) return;
-      final name = await _log.uploadToServer(document: report);
+      final documents = await compute(performanceReportDocuments, report);
+      String? name;
+      for (var i = 0; i < documents.length; i++) {
+        if (mounted) setState(() => _performanceUploadProgress = 'Sending part ${i + 1} of ${documents.length}');
+        name = await _log.uploadToServer(document: documents[i]);
+      }
       if (mounted)
         _showSnack(
-          'Performance report sent to server${name == null ? "" : ": $name"}',
+          'Performance report sent to server (${documents.length} file${documents.length == 1 ? "" : "s"})${name == null ? "" : ": $name"}',
         );
     } catch (e) {
       if (mounted)
@@ -47,7 +55,7 @@ class _DiagnosticsSettingsScreenState extends State<DiagnosticsSettingsScreen> {
           'Could not send report: ${describeError(e, AppLocalizations.of(context))}. The recording is still saved.',
         );
     } finally {
-      if (mounted) setState(() => _uploading = false);
+      if (mounted) setState(() { _uploading = false; _performanceUploadProgress = null; });
     }
   }
 
@@ -220,7 +228,7 @@ class _DiagnosticsSettingsScreenState extends State<DiagnosticsSettingsScreen> {
               _ActionTile(
                 icon: Icons.cloud_upload_outlined,
                 title: 'Send performance report to server',
-                subtitle: 'Stops recording and sends the detailed text report to your media server.',
+                subtitle: _performanceUploadProgress ?? 'Sends the full text report to your media server. Large recordings use numbered files.',
                 enabled:
                     _performance.hasReport &&
                     _supportsUpload &&
