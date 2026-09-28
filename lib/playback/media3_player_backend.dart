@@ -1,3 +1,5 @@
+import '../data/services/performance_recorder.dart';
+
 import 'dart:async';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
@@ -26,6 +28,8 @@ class Media3PlayerBackend extends PlayerBackend {
       supported: PlatformDetection.isAndroid,
     );
     _prefs.addListener(_onPreferencesChanged);
+    PerformanceRecorder.instance.addListener(_onPerformanceChanged);
+    _wasPerformanceRecording = PerformanceRecorder.instance.recording;
     _eventSub = _events.receiveBroadcastStream().listen(
       _handleEvent,
       onError: (_) {},
@@ -33,6 +37,15 @@ class Media3PlayerBackend extends PlayerBackend {
   }
 
   static const _control = MethodChannel('moonfin/media3_video_control');
+  bool _wasPerformanceRecording = false;
+
+  void _onPerformanceChanged() {
+    final recording = PerformanceRecorder.instance.recording;
+    if (_wasPerformanceRecording && !recording && !_disposed) {
+      unawaited(_invoke<void>('stopPerformanceRecording'));
+    }
+    _wasPerformanceRecording = recording;
+  }
   static const _events = EventChannel('moonfin/media3_video_events');
   static final _activityActionController =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -212,6 +225,8 @@ class Media3PlayerBackend extends PlayerBackend {
     if (_disposed || event is! Map) return;
     final map = event.map((k, v) => MapEntry(k.toString(), v));
     final eventType = map['event']?.toString();
+    if (eventType != null)
+      PerformanceRecorder.instance.mediaEvent(eventType, map);
 
     switch (eventType) {
       case 'state':
@@ -1080,7 +1095,12 @@ class Media3PlayerBackend extends PlayerBackend {
       _subtitleDelaySeconds = 0.0;
     }
     _subtitleDelaySessionId = subtitleDelaySessionId;
+    final diagnosticGeneration = isPreview
+        ? 0
+        : PerformanceRecorder.instance.mediaSourceOpened();
     await _invoke<void>('setSource', {
+      'diagnosticGeneration': diagnosticGeneration,
+      'diagnosticOverlay': diagnosticGeneration != 0 && PerformanceRecorder.instance.showOverlay,
       'url': url,
       'headers': headers,
       'autoPlay': autoPlay,
@@ -1556,6 +1576,7 @@ class Media3PlayerBackend extends PlayerBackend {
     _disposed = true;
     _letterboxCropper.cancel();
     _prefs.removeListener(_onPreferencesChanged);
+    PerformanceRecorder.instance.removeListener(_onPerformanceChanged);
     _audioDelayDebounce?.cancel();
     _audioDelayDebounce = null;
     _watchdogTimer?.cancel();

@@ -757,7 +757,13 @@ class ItemDetailViewModel extends ChangeNotifier {
             ),
       ];
 
-  Future<void> load({String? mediaSourceId}) async {
+  Future<void> load({String? mediaSourceId}) => PerformanceTrace.measure(
+    'details.load',
+    () => _loadRecorded(mediaSourceId: mediaSourceId),
+  );
+
+  Future<void> _loadRecorded({String? mediaSourceId}) async {
+    PerformanceTrace.observed(this, 'details');
     _similarInitialLoadComplete = false;
     _state = ItemDetailState.loading;
     _collectionItems = const [];
@@ -876,6 +882,7 @@ class ItemDetailViewModel extends ChangeNotifier {
       final savedAudioIndex = prefs.getItemAudioStreamIndex(itemId);
       _selectedAudioIndex = savedAudioIndex == -2 ? null : savedAudioIndex;
       _state = ItemDetailState.ready;
+      PerformanceTrace.event('details.data.ready');
       notifyListeners();
 
       _loadSecondary();
@@ -1888,7 +1895,12 @@ class ItemDetailViewModel extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> _loadParentCollection() async {
+  Future<void> _loadParentCollection() => PerformanceTrace.measure(
+    'collections.membership',
+    _loadParentCollectionRecorded,
+  );
+
+  Future<void> _loadParentCollectionRecorded() async {
     final item = _item;
     if (item == null) {
       _parentCollectionItems = const [];
@@ -2017,6 +2029,10 @@ class ItemDetailViewModel extends ChangeNotifier {
           enableTotalRecordCount: true,
         );
         final boxSets = (data['Items'] as List?) ?? const [];
+        PerformanceTrace.event('collections.page', {
+          'items': boxSets.length,
+          'offset': startIndex,
+        });
         if (boxSets.isEmpty) {
           break;
         }
@@ -2037,23 +2053,29 @@ class ItemDetailViewModel extends ChangeNotifier {
         const maxConcurrent = 12;
         for (var i = 0; i < candidates.length; i += maxConcurrent) {
           final batch = candidates.skip(i).take(maxConcurrent);
-          await Future.wait(batch.map((candidate) async {
-            final membership = await _client.itemsApi.getItems(
-              parentId: candidate.id,
-              fields: 'BasicSyncInfo',
-            );
-            final members = (membership['Items'] as List?) ?? const [];
-            final hasItem = members.whereType<Map>().any((entry) {
-              final map = entry.cast<String, dynamic>();
-              return map['Id'] == itemId;
-            });
-            if (hasItem) {
-              result[candidate.id] = (
-                name: candidate.name,
-                rawData: candidate.rawData,
+          await Future.wait(
+            batch.map((candidate) async {
+              final membership = await _client.itemsApi.getItems(
+                parentId: candidate.id,
+                fields: 'BasicSyncInfo',
               );
-            }
-          }));
+              final members = (membership['Items'] as List?) ?? const [];
+              PerformanceTrace.event('collections.membership_checked', {
+                'items': members.length,
+                'disposed': _isDisposed,
+              });
+              final hasItem = members.whereType<Map>().any((entry) {
+                final map = entry.cast<String, dynamic>();
+                return map['Id'] == itemId;
+              });
+              if (hasItem) {
+                result[candidate.id] = (
+                  name: candidate.name,
+                  rawData: candidate.rawData,
+                );
+              }
+            }),
+          );
         }
 
         if (boxSets.length < pageSize) {
@@ -2473,6 +2495,8 @@ class ItemDetailViewModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    PerformanceTrace.disposed(this, 'details');
+    PerformanceTrace.event('details.disposed');
     _isDisposed = true;
     userDataSync.removeListener(_onUserDataChanged);
     // The child owns a download poll timer, so this is what stops it.

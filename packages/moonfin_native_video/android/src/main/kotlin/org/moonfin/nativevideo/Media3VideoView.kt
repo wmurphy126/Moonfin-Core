@@ -64,6 +64,8 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DecoderReuseEvaluation
+import androidx.media3.exoplayer.source.LoadEventInfo
+import androidx.media3.exoplayer.source.MediaLoadData
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
@@ -1010,6 +1012,10 @@ class Media3VideoView(
     private var playerCreatedAtMs = 0L
     private val audioClockListener: (Long) -> Unit = { maybeRecoverAudioClock(it) }
     private var isPlayerReleased = false
+    private var diagnosticGeneration = 0
+    private var performanceLoads = 0
+    private var performanceBytes = 0L
+    private var diagnosticOverlay = false
     private var firstFrameRendered = false
 
     private val externalSubtitleConfigurations = mutableListOf<MediaItem.SubtitleConfiguration>()
@@ -1332,6 +1338,8 @@ class Media3VideoView(
             Media3Bridge.emitEvent(
                 mapOf(
                     "event" to "firstFrameRendered",
+                    "diagnosticGeneration" to diagnosticGeneration,
+                    "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
                     "positionMs" to player.currentPosition,
                 ),
             )
@@ -1345,11 +1353,64 @@ class Media3VideoView(
     }
 
     private val analyticsListener = object : AnalyticsListener {
+        override fun onLoadStarted(eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo, mediaLoadData: MediaLoadData) {
+            if (diagnosticGeneration == 0 || performanceLoads >= 5) return
+            Media3Bridge.emitEvent(mapOf(
+                "event" to "performanceLoadStart", "diagnosticGeneration" to diagnosticGeneration,
+                "nativeUs" to SystemClock.elapsedRealtimeNanos() / 1000,
+                "loadId" to loadEventInfo.loadTaskId,
+            ))
+        }
+
+        override fun onLoadError(eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo, mediaLoadData: MediaLoadData,
+            error: java.io.IOException, wasCanceled: Boolean) {
+            if (diagnosticGeneration == 0) return
+            Media3Bridge.emitEvent(mapOf(
+                "event" to "performanceLoadError", "diagnosticGeneration" to diagnosticGeneration,
+                "nativeUs" to SystemClock.elapsedRealtimeNanos() / 1000,
+                "loadId" to loadEventInfo.loadTaskId, "durationMs" to loadEventInfo.loadDurationMs,
+                "bytes" to loadEventInfo.bytesLoaded,
+                "outcome" to if (wasCanceled) "canceled" else "error",
+            ))
+        }
+
+        override fun onLoadCompleted(eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo, mediaLoadData: MediaLoadData) {
+            if (diagnosticGeneration == 0) return
+            performanceLoads++
+            performanceBytes += loadEventInfo.bytesLoaded
+            if (performanceLoads > 5 && performanceLoads % 25 != 0 && loadEventInfo.loadDurationMs < 1000) return
+            Media3Bridge.emitEvent(mapOf(
+                "event" to "performanceLoad",
+                "diagnosticGeneration" to diagnosticGeneration,
+                "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
+                "count" to performanceLoads,
+                "loadId" to loadEventInfo.loadTaskId,
+                "performanceBytes" to performanceBytes,
+                "durationMs" to loadEventInfo.loadDurationMs,
+                "bytes" to loadEventInfo.bytesLoaded,
+                "kind" to when (mediaLoadData.dataType) {
+                    C.DATA_TYPE_MANIFEST -> "manifest"
+                    C.DATA_TYPE_MEDIA -> "media"
+                    else -> "other"
+                },
+            ))
+        }
+
         override fun onVideoInputFormatChanged(
             eventTime: AnalyticsListener.EventTime,
             format: Format,
             decoderReuseEvaluation: DecoderReuseEvaluation?,
         ) {
+            if (diagnosticGeneration != 0) Media3Bridge.emitEvent(mapOf(
+                "event" to "performanceFormat", "diagnosticGeneration" to diagnosticGeneration,
+                "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
+                "width" to format.width, "height" to format.height,
+                "bitrate" to format.bitrate, "frameRate" to format.frameRate,
+                "codec" to format.sampleMimeType,
+            ))
             val frameRate = resolveSelectedVideoFrameRate() ?: format.frameRate
             if (frameRate.isFinite() && frameRate > 0f) {
                 maybeApplyFrameRateSwitching(frameRate)
@@ -1412,6 +1473,8 @@ class Media3VideoView(
             Media3Bridge.emitEvent(
                 mapOf(
                     "event" to "droppedFrames",
+                    "diagnosticGeneration" to diagnosticGeneration,
+                    "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
                     "count" to droppedFrames,
                     "elapsedMs" to elapsedMs,
                 ),
@@ -1427,6 +1490,8 @@ class Media3VideoView(
             Media3Bridge.emitEvent(
                 mapOf(
                     "event" to "audioUnderrun",
+                    "diagnosticGeneration" to diagnosticGeneration,
+                    "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
                     "bufferSizeMs" to bufferSizeMs,
                     "elapsedMs" to elapsedSinceLastFeedMs,
                 ),
@@ -1442,6 +1507,9 @@ class Media3VideoView(
             Media3Bridge.emitEvent(
                 mapOf(
                     "event" to "videoDecoderInit",
+                    "diagnosticGeneration" to diagnosticGeneration,
+                    "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
+                    "initializationDurationMs" to initializationDurationMs,
                     "decoder" to decoderName,
                 ),
             )
@@ -1458,6 +1526,9 @@ class Media3VideoView(
             Media3Bridge.emitEvent(
                 mapOf(
                     "event" to "audioDecoderInit",
+                    "diagnosticGeneration" to diagnosticGeneration,
+                    "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
+                    "initializationDurationMs" to initializationDurationMs,
                     "decoder" to decoderName,
                 ),
             )
@@ -2149,6 +2220,11 @@ class Media3VideoView(
     fun handleControlCall(call: MethodCall, result: MethodChannel.Result) {
         try {
             when (call.method) {
+                "stopPerformanceRecording" -> {
+                    diagnosticGeneration = 0
+                    diagnosticOverlay = false
+                    result.success(null)
+                }
                 "setSource" -> {
                     setSource(call.arguments)
                     result.success(null)
@@ -2511,6 +2587,10 @@ class Media3VideoView(
     private fun setSource(arguments: Any?) {
         val args = arguments as? Map<*, *> ?: return
         lastSourceArguments = args
+        diagnosticGeneration = (args["diagnosticGeneration"] as? Number)?.toInt() ?: 0
+        diagnosticOverlay = args["diagnosticOverlay"] == true
+        performanceLoads = 0
+        performanceBytes = 0L
         val url = args["url"]?.toString() ?: return
         val startPositionMs = (args["startPositionMs"] as? Number)?.toLong() ?: 0L
         val autoPlay = args["autoPlay"] as? Boolean ?: false
@@ -5126,6 +5206,11 @@ class Media3VideoView(
         val bufferedPosition = player.bufferedPosition
         val videoSize = player.videoSize
         return mapOf(
+            "diagnosticGeneration" to diagnosticGeneration,
+            "diagnosticOverlay" to (diagnosticOverlay && diagnosticGeneration != 0),
+            "nativeUs" to SystemClock.elapsedRealtimeNanos() / 1000,
+            "performanceBytes" to performanceBytes,
+            "performanceLoads" to performanceLoads,
             "positionMs" to player.currentPosition,
             "durationMs" to if (duration > 0) duration else 0L,
             "bufferedMs" to if (bufferedPosition > 0) bufferedPosition else 0L,

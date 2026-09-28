@@ -9,6 +9,32 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 class _FakeClientFactory extends Fake implements MediaServerClientFactory {}
 
+class _UploadApi implements ClientLogApi {
+  String? received;
+  @override
+  Future<String?> uploadDocument(String content) async {
+    received = content;
+    return 'performance.txt';
+  }
+}
+
+class _UploadClient extends Fake implements MediaServerClient {
+  _UploadClient(this.clientLogApi);
+  @override
+  final ClientLogApi clientLogApi;
+  @override
+  ServerType get serverType => ServerType.jellyfin;
+  @override
+  String get baseUrl => 'https://server.invalid';
+}
+
+class _UploadFactory extends Fake implements MediaServerClientFactory {
+  _UploadFactory(this.client);
+  final MediaServerClient client;
+  @override
+  MediaServerClient getActiveClient() => client;
+}
+
 const _device = DeviceInfo(
   id: 'dev-1',
   name: 'Test Device',
@@ -27,6 +53,22 @@ Future<LogService> _service({bool loggingEnabled = false}) async {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('performance upload sends the exact supplied report while normal logging is off', () async {
+    SharedPreferences.setMockInitialValues({});
+    final preferences = PreferenceStore();
+    await preferences.init();
+    final api = _UploadApi();
+    final logs = LogService(UserPreferences(preferences),
+        _UploadFactory(_UploadClient(api)), _device);
+    addTearDown(logs.dispose);
+    expect(logs.isEnabled, isFalse);
+    expect(logs.canUploadToServer, isTrue);
+    const report = 'Moonfin performance recording\nEVENTS JSONL\n{"tUs":0}';
+    expect(await logs.uploadToServer(document: report), 'performance.txt');
+    expect(api.received, report);
+    expect(api.received, isNot(contains(_device.id)));
+  });
 
   test('a crash is recorded even while diagnostic logging is off', () async {
     final logs = await _service();

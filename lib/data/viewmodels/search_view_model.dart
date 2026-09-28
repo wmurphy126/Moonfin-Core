@@ -165,17 +165,29 @@ class SearchViewModel extends ChangeNotifier {
     _executeSearch(trimmed);
   }
 
-  Future<void> _executeSearch(String query) async {
+  Future<void> _executeSearch(String query) => PerformanceTrace.measure(
+    'search.execute',
+    () => _executeSearchRecorded(query),
+  );
+
+  Future<void> _executeSearchRecorded(String query) async {
+    PerformanceTrace.observed(this, 'search');
     if (query != _query) return;
 
     try {
         final activeGroups = _scopedParentId != null
           ? _bookSearchGroups()
           : _searchGroups();
-      final seerrFuture = _fetchSeerrResults(query);
+      final seerrFuture = PerformanceTrace.measure(
+        'search.seerr',
+        () => _fetchSeerrResults(query),
+      );
       final gamesFuture = _scopedParentId != null
           ? Future.value(const <GameSearchResult>[])
-          : _fetchGameResults(query);
+          : PerformanceTrace.measure(
+              'search.games',
+              () => _fetchGameResults(query),
+            );
 
       final groups = _scopedParentId != null
           ? await Future.wait(activeGroups.map((group) async {
@@ -188,6 +200,7 @@ class SearchViewModel extends ChangeNotifier {
               return group.copyWith(items: items);
             }))
           : await _buildGroupedGlobalResults(query, activeGroups);
+      PerformanceTrace.event('search.library.ready', {'groups': groups.length});
       final seerr = await seerrFuture;
       final games = await gamesFuture;
 
@@ -197,6 +210,11 @@ class SearchViewModel extends ChangeNotifier {
       _seerrResults = seerr;
       _gameResults = games;
       _state = SearchState.ready;
+      PerformanceTrace.event('search.data.ready', {
+        'groups': _results.length,
+        'seerr': seerr.length,
+        'games': games.length,
+      });
     } catch (e) {
       if (query != _query) return;
       _error = e;
@@ -319,6 +337,7 @@ class SearchViewModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    PerformanceTrace.disposed(this, 'search');
     _debounceTimer?.cancel();
     super.dispose();
   }

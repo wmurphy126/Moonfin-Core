@@ -1,3 +1,7 @@
+import 'package:server_core/server_core.dart';
+
+import '../../data/services/performance_recorder.dart';
+
 import 'dart:async';
 
 import 'package:flutter/widgets.dart';
@@ -64,6 +68,7 @@ Future<bool> launchPlayerWhilePreparing(
     stale._cancelled = true;
   }
 
+  final performanceLaunch = PerformanceRecorder.instance.playTapped();
   final session = PlaybackLaunchSession._();
   _activeVideoLaunch = session;
 
@@ -75,6 +80,7 @@ Future<bool> launchPlayerWhilePreparing(
     manager.skipExternalRoutingOnce();
     routeFuture = context.push(Destinations.videoPlayer);
   } catch (_) {
+    performanceLaunch?.end(outcome: 'route_open_failed');
     // Release the slot before touching the manager again. The cleanup below
     // goes through the same call that just threw, and a second throw here
     // would leave the slot claimed for the rest of the process.
@@ -107,9 +113,13 @@ Future<bool> launchPlayerWhilePreparing(
     // Let the opaque black player and its loading treatment paint before any
     // item hydration, prompts, or source resolution continues.
     await WidgetsBinding.instance.endOfFrame;
+    performanceLaunch?.mark('play.loading_frame');
     if (!session.isActive) return false;
 
-    final started = await startPlayback(session);
+    final started = await PerformanceTrace.measure(
+      'play.preparation',
+      () => startPlayback(session),
+    );
     // A preparation that quietly gives up on the way to playItems still
     // reports success, and taking it at its word parks the player route on a
     // bringup that never leaves preparing. Nothing was asked to play, so the
@@ -157,6 +167,7 @@ Future<bool> launchPlayerWhilePreparing(
     manager.cancelPlaybackPreparation();
     rethrow;
   } finally {
+    performanceLaunch?.end(outcome: 'route_closed_before_first_frame');
     session._cancelled = true;
     if (identical(_activeVideoLaunch, session)) {
       _activeVideoLaunch = null;

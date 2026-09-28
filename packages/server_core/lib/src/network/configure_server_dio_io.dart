@@ -7,6 +7,7 @@ import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 
 import '../diagnostics/server_log_sink.dart';
+import '../diagnostics/performance_interceptor.dart';
 import 'server_user_agent.dart';
 
 /// How many requests may be reaching the server at once.
@@ -27,6 +28,7 @@ const _requestSlots = 6;
 const _idleTimeout = Duration(seconds: 15);
 
 void configureServerDio(Dio dio, {Duration? idleTimeout}) {
+  dio.interceptors.add(PerformanceInterceptor());
   dio.transformer = FusedTransformer(contentLengthIsolateThreshold: 50 * 1024);
 
   dio.httpClientAdapter = _SlotLimitedAdapter(
@@ -136,9 +138,21 @@ class _SlotLimitedAdapter implements HttpClientAdapter {
     Stream<Uint8List>? requestStream,
     Future<void>? cancelFuture,
   ) async {
+    final timing = PerformanceInterceptor.span(options);
+    timing?.mark('http.queued', {'queued': _waiting.length, 'free': _free});
+    final queuedAt = timing?.elapsedUs;
     await _acquire();
+    final dispatchedAt = timing?.elapsedUs;
+    timing?.mark('http.dispatched', {
+      'durationUs': dispatchedAt! - queuedAt!,
+    });
     try {
-      return await _inner.fetch(options, requestStream, cancelFuture);
+      final body = await _inner.fetch(options, requestStream, cancelFuture);
+      timing?.mark('http.headers', {
+        'status': body.statusCode,
+        'durationUs': timing.elapsedUs - dispatchedAt!,
+      });
+      return body;
     } finally {
       _release();
     }

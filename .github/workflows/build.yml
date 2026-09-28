@@ -11,6 +11,10 @@ on:
         description: Run Android job
         type: boolean
         default: false
+      android_test_build:
+        description: Install Android builds alongside the normal app for device testing
+        type: boolean
+        default: false
       ios:
         description: Run iOS job
         type: boolean
@@ -62,6 +66,8 @@ jobs:
   android:
     if: ${{ (github.event_name != 'workflow_dispatch' || inputs.run_all || inputs.android) && inputs.distribution != 'testflight' }}
     runs-on: ubuntu-latest
+    env:
+      MOONFIN_TEST_ID_SUFFIX: ${{ inputs.android_test_build && '.performance' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -750,7 +756,7 @@ jobs:
   # nothing imports and a failing test are invisible to them. This job is
   # what the PR comment reads its Tests line from.
   tests:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_all }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_all || inputs.android }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

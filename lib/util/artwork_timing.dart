@@ -65,7 +65,7 @@ class ArtworkTiming {
 class ArtworkTimings {
   ArtworkTimings._();
 
-  static bool get enabled => ServerLog.sink != null;
+  static bool get enabled => ServerLog.sink != null || PerformanceTrace.enabled;
 
   /// Long enough that a screenful of posters lands in one line, short enough
   /// that a single scroll shows up as its own line in the export.
@@ -186,6 +186,10 @@ class ArtworkTimings {
 
   static void indexFlushed({required int entries, required Duration took}) {
     if (!enabled) return;
+    PerformanceTrace.event('artwork.index_flush', {
+      'entries': entries,
+      'durationUs': took.inMicroseconds,
+    });
     ServerLog.emit(
       'artwork',
       ServerLogLevel.debug,
@@ -219,6 +223,18 @@ class ArtworkTimings {
       (max, t) => t.queueDepth > max ? t.queueDepth : max,
     );
     final failed = timings.where((t) => t.error != null).length;
+
+    PerformanceTrace.event('artwork.window', {
+      'requests': timings.length,
+      'hits': hits,
+      'failed': failed,
+      'inflight': _inFlight,
+      'queuedMax': maxDepth,
+      'queueP95Ms': num.tryParse(_p(queue, 95)),
+      'headerP95Ms': num.tryParse(_p(header, 95)),
+      'transferP95Ms': num.tryParse(_p(transfer, 95)),
+      'bytes': timings.fold<int>(0, (sum, t) => sum + t.bytes),
+    });
 
     ServerLog.emit(
       'artwork',

@@ -320,7 +320,7 @@ class LogService extends ChangeNotifier {
   ///
   /// Returns the server-assigned file name on success. Throws [StateError] if
   /// no server is active or the server will not take a report.
-  Future<String?> uploadToServer() async {
+  Future<String?> uploadToServer({String? document}) async {
     final MediaServerClient client;
     try {
       client = _clientFactory.getActiveClient();
@@ -337,7 +337,7 @@ class LogService extends ChangeNotifier {
       '${client.baseUrl}',
       level: LogLevel.info,
     );
-    final fileName = await api.uploadDocument(exportText());
+    final fileName = await api.uploadDocument(document ?? exportText());
     log(
       LogCategory.general,
       'Diagnostic report uploaded: ${fileName ?? '(unnamed)'}',

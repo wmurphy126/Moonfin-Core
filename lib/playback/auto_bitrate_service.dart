@@ -60,6 +60,9 @@ class AutoBitrateService {
     final cached = _cache[key];
     if (cached != null &&
         DateTime.now().difference(cached.measuredAt) < _cacheLifetime) {
+      PerformanceTrace.event('play.auto_bitrate.cache_hit', {
+        'bitrate': cached.bps,
+      });
       return Future.value(cached.bps);
     }
 
@@ -88,7 +91,12 @@ class AutoBitrateService {
     return bps;
   }
 
-  Future<int> _measure(MediaServerClient client) async {
+  Future<int> _measure(MediaServerClient client) => PerformanceTrace.measure(
+    'play.auto_bitrate',
+    () => _measureRecorded(client),
+  );
+
+  Future<int> _measureRecorded(MediaServerClient client) async {
     // The probe runs on its own client, so without these lines it is
     // invisible in the network log and a start waiting on it looks hung.
     final log = GetIt.instance<LogService>();
@@ -116,11 +124,13 @@ class AutoBitrateService {
       ),
     );
 
+    dio.interceptors.add(PerformanceInterceptor());
     try {
       final measured = await stepThroughProbes(
         (bytes) => _sample(dio, base, bytes, log),
       );
       if (measured == null) {
+        PerformanceTrace.event('play.auto_bitrate.result', {'outcome': 'fallback', 'bitrate': _fallbackBps});
         log.log(
           LogCategory.playback,
           'Auto bitrate: nothing measured, using ${_fallbackBps}bps',
@@ -128,6 +138,7 @@ class AutoBitrateService {
         return _fallbackBps;
       }
       final bps = min((measured * _safetyFactor).round(), _maxBps);
+      PerformanceTrace.event('play.auto_bitrate.result', {'outcome': 'measured', 'bitrate': bps});
       _cache[client.baseUrl] = (bps: bps, measuredAt: DateTime.now());
       log.log(LogCategory.playback, 'Auto bitrate: measured ${bps}bps');
       return bps;
@@ -139,7 +150,19 @@ class AutoBitrateService {
   /// Times one body from the moment its headers arrive, so the connection
   /// setup and the server's own turnaround don't count against the link.
   /// Past [_probeBudget] it stops reading and times what came.
-  Future<int?> _sample(Dio dio, String base, int bytes, LogService log) async {
+  Future<int?> _sample(Dio dio, String base, int bytes, LogService log) =>
+      PerformanceTrace.measure(
+        'play.bitrate_probe',
+        () => _sampleRecorded(dio, base, bytes, log),
+        data: {'bytes': bytes},
+      );
+
+  Future<int?> _sampleRecorded(
+    Dio dio,
+    String base,
+    int bytes,
+    LogService log,
+  ) async {
     try {
       final response = await dio.get<ResponseBody>(
         '$base/Playback/BitrateTest?size=$bytes',
@@ -158,12 +181,17 @@ class AutoBitrateService {
         }
       }
       final seconds = stopwatch.elapsedMicroseconds / 1000000;
+      PerformanceTrace.event('play.bitrate_probe.transfer', {
+        'bytes': received, 'durationUs': stopwatch.elapsedMicroseconds,
+        'outcome': outOfTime ? 'budget_reached' : 'complete',
+      });
       // A body that ended short on its own measures the server giving up,
       // not the link.
       if (!outOfTime && received < bytes ~/ 4) return null;
       if (received == 0 || seconds <= 0) return null;
       return (received * 8 / seconds).round();
     } catch (e) {
+      PerformanceTrace.event('play.bitrate_probe.failed', {'kind': e.runtimeType.toString()});
       log.log(
         LogCategory.playback,
         'Auto bitrate: $bytes byte probe failed ($e)',
