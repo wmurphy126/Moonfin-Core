@@ -17,12 +17,14 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Samples only on explicit Dart requests. PSS/proc reads stay off the UI thread. */
 class PerformanceDiagnostics(activity: Activity, messenger: BinaryMessenger) {
     private val context = activity.applicationContext
     private val activityRef = WeakReference(activity)
     private val worker = Executors.newSingleThreadExecutor()
+    private val sampling = AtomicBoolean(false)
     private val main = Handler(Looper.getMainLooper())
     private val channel = MethodChannel(messenger, "moonfin/performance")
     @Volatile private var closed = false
@@ -33,6 +35,10 @@ class PerformanceDiagnostics(activity: Activity, messenger: BinaryMessenger) {
                 result.notImplemented()
             } else if (closed) {
                 result.error("closed", "Diagnostic sampler closed", null)
+            } else if (!sampling.compareAndSet(false, true)) {
+                // Dart can time out while Android is still collecting a sample.
+                // Never let subsequent requests accumulate behind a stuck read.
+                result.error("busy", "Resource sample already running", null)
             } else {
                 val memory = call.argument<Boolean>("memory") == true
                 @Suppress("DEPRECATION")
@@ -41,9 +47,11 @@ class PerformanceDiagnostics(activity: Activity, messenger: BinaryMessenger) {
                     try {
                         val values = sample(memory).toMutableMap()
                         values["refreshHz"] = refresh
-                        main.post { result.success(values) }
+                        main.post { if (!closed) result.success(values) }
                     } catch (_: Exception) {
-                        main.post { result.error("sample_failed", "Resource sample unavailable", null) }
+                        main.post { if (!closed) result.error("sample_failed", "Resource sample unavailable", null) }
+                    } finally {
+                        sampling.set(false)
                     }
                 }
             }

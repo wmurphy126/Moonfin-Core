@@ -96,6 +96,12 @@ fi
 echo "APK created: $APK_SOURCE"
 echo "APK copied to root: $APK_OUTPUT"
 
+# Device-testing runs only need the installable mobile APK. Normal release
+# builds still produce both flavors and both distribution formats below.
+if [ "${MOONFIN_ANDROID_APK_ONLY:-false}" = "true" ]; then
+  exit 0
+fi
+
 echo "Building Android App Bundle..."
 if ! "$FLUTTER" build appbundle --release \
   --flavor mobile \
