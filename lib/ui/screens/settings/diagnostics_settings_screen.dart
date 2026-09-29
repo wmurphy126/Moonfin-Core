@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart';
 import 'package:get_it/get_it.dart';
 import 'package:moonfin_design/moonfin_design.dart';
 
 import '../../../data/services/log_service.dart';
+import '../../../data/services/performance_recorder.dart';
+import '../../../data/services/performance_report_upload.dart';
 import '../../../preference/user_preferences.dart';
 import '../../../util/artwork_timing.dart';
 import '../../../util/focus/dpad_keys.dart';
@@ -27,7 +30,44 @@ class _DiagnosticsSettingsScreenState extends State<DiagnosticsSettingsScreen> {
   LogService get _log => GetIt.instance<LogService>();
 
   bool _uploading = false;
+  String? _performanceUploadProgress;
+  final _performance = PerformanceRecorder.instance;
   LogCategory? _filter;
+
+  Future<void> _sendPerformance() async {
+    setState(() => _uploading = true);
+    try {
+      final report = await _performance.report();
+      if (report == null) return;
+      final documents = await compute(performanceReportDocuments, report);
+      String? name;
+      for (var i = 0; i < documents.length; i++) {
+        if (mounted) setState(() => _performanceUploadProgress = 'Sending part ${i + 1} of ${documents.length}');
+        name = await _log.uploadToServer(document: documents[i]);
+      }
+      if (mounted)
+        _showSnack(
+          'Performance report sent to server (${documents.length} file${documents.length == 1 ? "" : "s"})${name == null ? "" : ": $name"}',
+        );
+    } catch (e) {
+      if (mounted)
+        _showSnack(
+          'Could not send report: ${describeError(e, AppLocalizations.of(context))}. The recording is still saved.',
+        );
+    } finally {
+      if (mounted) setState(() { _uploading = false; _performanceUploadProgress = null; });
+    }
+  }
+
+  Future<void> _copyPerformanceSummary() async {
+    final report = await _performance.report();
+    if (report == null) return;
+    // Android clipboard transactions are bounded; the full journal goes to the server.
+    await Clipboard.setData(
+      ClipboardData(text: report.split('EVENTS JSONL').first),
+    );
+    if (mounted) _showSnack('Performance summary copied');
+  }
 
   Future<void> _sendReport() async {
     setState(() => _uploading = true);
@@ -114,7 +154,7 @@ class _DiagnosticsSettingsScreenState extends State<DiagnosticsSettingsScreen> {
             const Text('Diagnostics & Logging'),
           ),
           body: AnimatedBuilder(
-            animation: _log,
+            animation: Listenable.merge([_log, _performance]),
             builder: (context, _) => _buildBody(context),
           ),
         ),
@@ -139,6 +179,71 @@ class _DiagnosticsSettingsScreenState extends State<DiagnosticsSettingsScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              const _Section(title: 'Performance recording'),
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 8,
+                ),
+                child: Text(
+                  '${_performance.status}\n'
+                  'Captures action timings, requests, UI frames, playback and Android resources. '
+                  'No media names or credentials. Stops after 30 minutes; keeps three local recordings. '
+                  'Nothing is uploaded until you send it.',
+                ),
+              ),
+              _ActionTile(
+                icon: _performance.recording
+                    ? Icons.stop_circle_outlined
+                    : Icons.fiber_manual_record,
+                title: _performance.recording
+                    ? 'Stop recording (${_performance.elapsedSeconds}s)'
+                    : 'Start performance recording',
+                subtitle: 'Use Moonfin normally, then return here to send the report.',
+                enabled: !_performance.busy && !_uploading,
+                onTap: () async {
+                  if (_performance.recording) {
+                    await _performance.stop();
+                  } else {
+                    await _performance.start();
+                  }
+                },
+              ),
+              _ActionTile(
+                icon: Icons.flag_outlined,
+                title: 'Mark a slow moment',
+                subtitle:
+                    '${_performance.markerCount} moments marked in this recording.',
+                enabled: _performance.recording,
+                onTap: _performance.marker,
+              ),
+              SwitchListTile(
+                title: const Text('Show recording controls'),
+                subtitle: const Text(
+                  'Small CPU/memory display and a marker button. Hide for timing comparisons.',
+                ),
+                value: _performance.showOverlay,
+                onChanged: _performance.overlay,
+              ),
+              _ActionTile(
+                icon: Icons.cloud_upload_outlined,
+                title: 'Send performance report to server',
+                subtitle: _performanceUploadProgress ?? 'Sends the full text report to your media server. Large recordings use numbered files.',
+                enabled:
+                    _performance.hasReport &&
+                    _supportsUpload &&
+                    !_uploading &&
+                    !_performance.busy,
+                onTap: _sendPerformance,
+              ),
+              _ActionTile(
+                icon: Icons.copy,
+                title: 'Copy performance summary',
+                subtitle: 'Stops recording and copies the summary. The server report also includes the full event journal.',
+                enabled:
+                    _performance.hasReport && !_uploading && !_performance.busy,
+                onTap: _copyPerformanceSummary,
+              ),
               const _Section(title: 'Logging'),
               SwitchPreferenceTile(
                 preference: UserPreferences.diagnosticLoggingEnabled,

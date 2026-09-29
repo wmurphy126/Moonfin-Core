@@ -665,7 +665,7 @@ class _SpotlightCardsBuilder {
 
   SpotlightCardSpec? _episodeMoreEpisodesCard() {
     if (item.seriesId != null && !vm.seriesEpisodesLoaded) {
-      vm.loadAllSeriesEpisodes();
+      vm.loadAllSeriesEpisodes(caller: 'spotlight');
     }
     final allEpisodes = vm.seriesEpisodes;
     final episodes = allEpisodes.isNotEmpty ? allEpisodes : vm.episodes;

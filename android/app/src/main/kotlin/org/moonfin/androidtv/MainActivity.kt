@@ -83,6 +83,7 @@ class MainActivity : AudioServiceActivity(), GamepadsCompatibleActivity {
     }
 
     private var methodChannel: MethodChannel? = null
+    private var performanceDiagnostics: PerformanceDiagnostics? = null
     private var castChannel: MethodChannel? = null
     private var castEventsChannel: EventChannel? = null
     private var castEventsSink: EventChannel.EventSink? = null
@@ -347,6 +348,8 @@ class MainActivity : AudioServiceActivity(), GamepadsCompatibleActivity {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        performanceDiagnostics?.close()
+        performanceDiagnostics = PerformanceDiagnostics(this, flutterEngine.dartExecutor.binaryMessenger)
         engineHandedToActivity = flutterEngine
 
         val bridge = LibretroBridge(
@@ -1092,6 +1095,8 @@ class MainActivity : AudioServiceActivity(), GamepadsCompatibleActivity {
     }
 
     override fun onDestroy() {
+        performanceDiagnostics?.close()
+        performanceDiagnostics = null
         val shouldTerminateProcess = isFinishing && !isChangingConfigurations
         // Process-wide InputManager registration: without this the listener
         // keeps this Activity alive across every recreation.

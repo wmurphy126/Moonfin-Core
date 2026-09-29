@@ -1,3 +1,5 @@
+import '../../data/services/performance_recorder.dart';
+
 import 'package:flutter/material.dart';
 import 'package:get_it/get_it.dart';
 import 'package:go_router/go_router.dart';
@@ -191,6 +193,7 @@ CustomTransitionPage<T> _opaqueFullScreenPage<T>({
 final appRouter = GoRouter(
   initialLocation: Destinations.startup,
   observers: [
+    PerformanceRouteObserver(),
     FocusRouteObserver(),
     RetroArtworkRouteObserver.instance,
     routeLifecycleObserver,

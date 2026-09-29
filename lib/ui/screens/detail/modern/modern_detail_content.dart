@@ -5017,7 +5017,7 @@ class _ModernDetailContentState extends State<ModernDetailContent> {
     _upNextResolvedThisBuild = false;
 
     if (item.type == 'Series') {
-      _vm.loadAllSeriesEpisodes();
+      _vm.loadAllSeriesEpisodes(caller: 'modern_build');
     }
 
     final l10n = AppLocalizations.of(context);

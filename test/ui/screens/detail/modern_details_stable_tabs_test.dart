@@ -129,7 +129,7 @@ void main() {
     when(() => vm.isSeerrOnly).thenReturn(false);
     when(() => vm.localPersonId).thenReturn(null);
     when(() => vm.nextUp).thenReturn(null);
-    when(() => vm.loadAllSeriesEpisodes()).thenAnswer((_) async {});
+    when(() => vm.loadAllSeriesEpisodes(caller: any(named: 'caller'))).thenAnswer((_) async {});
     when(() => vm.addListener(any())).thenReturn(null);
     when(() => vm.removeListener(any())).thenReturn(null);
     when(() => vm.ratings).thenReturn({});

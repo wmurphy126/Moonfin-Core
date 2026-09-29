@@ -19,6 +19,8 @@ void main() {
       await server.close(force: true);
       // The version is process-wide, so clear it to keep tests independent.
       setServerUserAgentVersion('');
+      PerformanceTrace.sink = null;
+      PerformanceTrace.resetAliases();
     });
 
     // Answers one request and reports the user agent it arrived with.
@@ -76,6 +78,47 @@ void main() {
         'Mozilla/5.0 (compatible; Moonfin/Flutter)',
       );
     });
+
+    test(
+      'headers and body transformation are separate without consuming streams',
+      () async {
+        final events = <String>[];
+        PerformanceTrace.sink = (event, _) => events.add(event);
+        requests = server.listen((request) async {
+          request.response.headers.contentType = ContentType.json;
+          request.response.write('{"Items":[1,2]}');
+          await request.response.close();
+        });
+        final dio = Dio();
+        configureServerDio(dio);
+        try {
+          final url = 'http://127.0.0.1:${server.port}/Items';
+          expect((await dio.get(url)).data['Items'], [1, 2]);
+          expect(
+            events,
+            containsAllInOrder([
+              'http.dispatched',
+              'http.headers',
+              'http.body_and_transform',
+              'span.end',
+            ]),
+          );
+          events.clear();
+          final response = await dio.get<ResponseBody>(
+            url,
+            options: Options(responseType: ResponseType.stream),
+          );
+          expect(events, contains('http.stream_handoff'));
+          expect(events, isNot(contains('http.body_and_transform')));
+          expect(
+            await response.data!.stream.expand((chunk) => chunk).toList(),
+            isNotEmpty,
+          );
+        } finally {
+          dio.close(force: true);
+        }
+      },
+    );
   });
 
   // A screen that asks for more at once than the slots hold has to queue, and

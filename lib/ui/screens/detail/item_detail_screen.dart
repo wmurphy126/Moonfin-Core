@@ -8757,7 +8757,11 @@ class DetailActionButtonsState extends State<DetailActionButtons> {
     return clientFactory.getClientIfExists(item.serverId) ?? defaultClient;
   }
 
-  Future<AggregatedItem> _ensureHydrated(AggregatedItem target) async {
+  Future<AggregatedItem> _ensureHydrated(AggregatedItem target) =>
+      PerformanceTrace.measure('play.prepare.hydrate', () => _ensureHydratedRecorded(target),
+        data: {'cached': target.mediaSources.isNotEmpty});
+
+  Future<AggregatedItem> _ensureHydratedRecorded(AggregatedItem target) async {
     if (target.mediaSources.isNotEmpty) {
       return target;
     }
@@ -8807,7 +8811,7 @@ class DetailActionButtonsState extends State<DetailActionButtons> {
 
     try {
       final client = _clientForItem(item);
-      final intros = await client.itemsApi.getIntros(item.id);
+      final intros = await PerformanceTrace.measure('play.prepare.prerolls', () => client.itemsApi.getIntros(item.id));
       if (intros.isEmpty) {
         return const [];
       }

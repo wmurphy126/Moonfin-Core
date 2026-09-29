@@ -769,7 +769,13 @@ class ItemDetailViewModel extends ChangeNotifier {
             ),
       ];
 
-  Future<void> load({String? mediaSourceId}) async {
+  Future<void> load({String? mediaSourceId}) => PerformanceTrace.measure(
+    'details.load',
+    () => _loadRecorded(mediaSourceId: mediaSourceId),
+  );
+
+  Future<void> _loadRecorded({String? mediaSourceId}) async {
+    PerformanceTrace.observed(this, 'details');
     _similarInitialLoadComplete = false;
     _state = ItemDetailState.loading;
     _collectionItems = const [];
@@ -886,6 +892,7 @@ class ItemDetailViewModel extends ChangeNotifier {
       final savedAudioIndex = prefs.getItemAudioStreamIndex(itemId);
       _selectedAudioIndex = savedAudioIndex == -2 ? null : savedAudioIndex;
       _state = ItemDetailState.ready;
+      PerformanceTrace.event('details.data.ready');
       notifyListeners();
 
       _loadSecondary();
@@ -1019,12 +1026,26 @@ class ItemDetailViewModel extends ChangeNotifier {
   /// Loads every episode of the current Series (all seasons) on demand. Used by
   /// the Modern and Nouveau detail layout's Episodes tab, accurate season counts,
   /// and the Spotlight More Episodes modal. No-op once already loaded.
-  Future<void> loadAllSeriesEpisodes() async {
+  int _episodeDiagnosticAttempt = 0;
+
+  Future<void> loadAllSeriesEpisodes({String caller = 'unspecified'}) async {
+    final trace = PerformanceTrace.begin('details.episodes', {
+      'caller': caller,
+      'resource': PerformanceTrace.resource(this),
+      'idKind': PerformanceTrace.identifierKind(itemId),
+      'seerrOnly': _isSeerrOnly,
+      'alreadyRequested': _seriesEpisodesRequested,
+      'attempt': PerformanceTrace.enabled ? ++_episodeDiagnosticAttempt : 0,
+    });
+    return PerformanceTrace.within(trace, () => _loadAllSeriesEpisodesRecorded(trace));
+  }
+
+  Future<void> _loadAllSeriesEpisodesRecorded(PerformanceSpan? trace) async {
     final item = _item;
-    if (item == null) return;
+    if (item == null) { trace?.end(outcome: 'no_item'); return; }
     final seriesId = item.type == 'Series' ? itemId : item.seriesId;
-    if (seriesId == null || seriesId.isEmpty) return;
-    if (_seriesEpisodesRequested) return;
+    if (seriesId == null || seriesId.isEmpty) { trace?.end(outcome: 'no_series'); return; }
+    if (_seriesEpisodesRequested) { trace?.end(outcome: 'already_requested'); return; }
     _seriesEpisodesRequested = true;
     try {
       final data = await _client.itemsApi.getEpisodes(
@@ -1036,9 +1057,11 @@ class ItemDetailViewModel extends ChangeNotifier {
         items,
         fallbackRating: _item?.officialRating,
       );
+      trace?.end(data: {'items': items.length});
       _seriesEpisodesLoaded = true;
       notifyListeners();
     } catch (_) {
+      trace?.end(outcome: 'api_error', data: {'retryOnRebuild': true});
       // Left unloaded and silent on purpose. The Modern layout calls this from
       // build, so the next rebuild gets another go, and notifying here would
       // turn that into a loop against a server that is down.
@@ -1049,7 +1072,7 @@ class ItemDetailViewModel extends ChangeNotifier {
   Future<void> refreshSeriesEpisodes() {
     _seriesEpisodesRequested = false;
     _seriesEpisodesLoaded = false;
-    return loadAllSeriesEpisodes();
+    return loadAllSeriesEpisodes(caller: 'refresh');
   }
 
   Future<void> _loadNextUp() async {
@@ -1898,7 +1921,12 @@ class ItemDetailViewModel extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> _loadParentCollection() async {
+  Future<void> _loadParentCollection() => PerformanceTrace.measure(
+    'collections.membership',
+    _loadParentCollectionRecorded,
+  );
+
+  Future<void> _loadParentCollectionRecorded() async {
     final item = _item;
     if (item == null) {
       _parentCollections = const [];
@@ -2016,6 +2044,10 @@ class ItemDetailViewModel extends ChangeNotifier {
           enableTotalRecordCount: true,
         );
         final boxSets = (data['Items'] as List?) ?? const [];
+        PerformanceTrace.event('collections.page', {
+          'items': boxSets.length,
+          'offset': startIndex,
+        });
         if (boxSets.isEmpty) {
           break;
         }
@@ -2036,23 +2068,29 @@ class ItemDetailViewModel extends ChangeNotifier {
         const maxConcurrent = 12;
         for (var i = 0; i < candidates.length; i += maxConcurrent) {
           final batch = candidates.skip(i).take(maxConcurrent);
-          await Future.wait(batch.map((candidate) async {
-            final membership = await _client.itemsApi.getItems(
-              parentId: candidate.id,
-              fields: 'BasicSyncInfo',
-            );
-            final members = (membership['Items'] as List?) ?? const [];
-            final hasItem = members.whereType<Map>().any((entry) {
-              final map = entry.cast<String, dynamic>();
-              return map['Id'] == itemId;
-            });
-            if (hasItem) {
-              result[candidate.id] = (
-                name: candidate.name,
-                rawData: candidate.rawData,
+          await Future.wait(
+            batch.map((candidate) async {
+              final membership = await _client.itemsApi.getItems(
+                parentId: candidate.id,
+                fields: 'BasicSyncInfo',
               );
-            }
-          }));
+              final members = (membership['Items'] as List?) ?? const [];
+              PerformanceTrace.event('collections.membership_checked', {
+                'items': members.length,
+                'disposed': _isDisposed,
+              });
+              final hasItem = members.whereType<Map>().any((entry) {
+                final map = entry.cast<String, dynamic>();
+                return map['Id'] == itemId;
+              });
+              if (hasItem) {
+                result[candidate.id] = (
+                  name: candidate.name,
+                  rawData: candidate.rawData,
+                );
+              }
+            }),
+          );
         }
 
         if (boxSets.length < pageSize) {
@@ -2137,7 +2175,9 @@ class ItemDetailViewModel extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> _loadSimilar() async {
+  Future<void> _loadSimilar() => PerformanceTrace.measure('details.recommendations', _loadSimilarRecorded);
+
+  Future<void> _loadSimilarRecorded() async {
     try {
       final item = _item;
       if (item != null && (item.type == 'Movie' || item.type == 'Series')) {
@@ -2472,6 +2512,8 @@ class ItemDetailViewModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    PerformanceTrace.disposed(this, 'details');
+    PerformanceTrace.event('details.disposed');
     _isDisposed = true;
     userDataSync.removeListener(_onUserDataChanged);
     // The child owns a download poll timer, so this is what stops it.

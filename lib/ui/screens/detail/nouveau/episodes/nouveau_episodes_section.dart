@@ -328,7 +328,7 @@ class NouveauEpisodesSectionState extends State<NouveauEpisodesSection> {
     }
 
     unawaited(
-      viewModel.loadAllSeriesEpisodes().whenComplete(() {
+      viewModel.loadAllSeriesEpisodes(caller: 'nouveau').whenComplete(() {
         if (!mounted || !identical(_vm, viewModel)) {
           return;
         }

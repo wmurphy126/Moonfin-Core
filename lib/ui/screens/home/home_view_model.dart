@@ -363,7 +363,22 @@ class HomeViewModel extends ChangeNotifier {
     required bool couldReachServer,
   }) => canReachServer && !couldReachServer;
 
-  Future<void> load({bool preserveExisting = false, bool forceRefresh = false}) async {
+  Future<void> load({
+    bool preserveExisting = false,
+    bool forceRefresh = false,
+  }) => PerformanceTrace.measure(
+    'home.load',
+    () => _loadRecorded(
+      preserveExisting: preserveExisting,
+      forceRefresh: forceRefresh,
+    ),
+    data: {'preserve': preserveExisting, 'refresh': forceRefresh},
+  );
+
+  Future<void> _loadRecorded({
+    bool preserveExisting = false,
+    bool forceRefresh = false,
+  }) async {
     _checkAndTriggerDailyExternalRowsRefresh();
     if (_isLoading) {
       _reloadRequestedWhileLoading = true;
@@ -630,6 +645,7 @@ class HomeViewModel extends ChangeNotifier {
           }
         }
         _rows = newRows;
+        PerformanceTrace.event('home.row.data.ready', {'rows': _rows.length});
         notifyListeners();
       }
 
@@ -651,6 +667,7 @@ class HomeViewModel extends ChangeNotifier {
       _tvChannels.update();
     } finally {
       _isLoading = false;
+      PerformanceTrace.event('home.data.ready', {'rows': _rows.length});
       notifyListeners();
       if (_reloadRequestedWhileLoading) {
         final nextPreserveExisting = _pendingReloadPreserveExisting;

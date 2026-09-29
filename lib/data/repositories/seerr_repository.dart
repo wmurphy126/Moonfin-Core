@@ -195,7 +195,7 @@ class SeerrRepository {
   }
 
   Future<SeerrUser> getCurrentUser() =>
-      _withClient((c) async => SeerrUser.fromJson(await c.getCurrentUser()));
+      PerformanceTrace.measure('seerr.permissions', () => _withClient((c) async => SeerrUser.fromJson(await c.getCurrentUser())));
 
   Future<MoonfinStatusResponse> configureWithMoonfin({
     required String jellyfinBaseUrl,
@@ -713,6 +713,10 @@ class SeerrRepository {
   ) async {
     final key = '$mediaType:$tmdbId';
     final cached = _mediaSummaryCache[key];
+    PerformanceTrace.event('cache.seerr', {
+      'entries': _mediaSummaryCache.length,
+      'hit': cached != null,
+    });
     if (cached != null) return cached;
 
     try {
@@ -731,6 +735,10 @@ class SeerrRepository {
         );
       }
       _mediaSummaryCache[key] = summary;
+      PerformanceTrace.event('cache.seerr', {
+        'entries': _mediaSummaryCache.length,
+        'hit': false,
+      });
       return summary;
     } catch (_) {
       return null;

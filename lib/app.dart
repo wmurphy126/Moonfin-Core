@@ -18,6 +18,8 @@ import 'auth/repositories/session_repository.dart';
 import 'data/models/aggregated_item.dart';
 import 'data/services/cast/cast_service.dart';
 import 'data/services/connectivity_service.dart';
+import 'data/services/performance_recorder.dart';
+import 'ui/widgets/performance_recording_overlay.dart';
 import 'data/services/download_service.dart';
 import 'data/services/seerr_notification_service.dart';
 import 'data/services/plugin_sync_service.dart';
@@ -81,6 +83,7 @@ class _MoonfinAppState extends State<MoonfinApp> {
   @override
   void initState() {
     super.initState();
+    unawaited(PerformanceRecorder.instance.initialize());
     _prefs = GetIt.instance<UserPreferences>();
     _themeController = AppThemeController.fromPreferences(_prefs);
     _lastResolvedLocale = _resolveLocale();
@@ -312,6 +315,7 @@ class _MoonfinAppState extends State<MoonfinApp> {
                                   : const SizedBox.shrink(),
                             ),
                             shell,
+                            const PerformanceRecordingOverlay(),
                             if (PlatformDetection.isTV) const ScreensaverHost(),
                           ],
                         );

@@ -99,6 +99,8 @@ class Media3PlayerActivity : ComponentActivity() {
         setContent {
             val isInPip = isInPipModeState.value
             var uiState by remember { mutableStateOf(Media3UiState()) }
+            var diagnosticControls by remember { mutableStateOf(false) }
+            var diagnosticMarks by remember { mutableStateOf(0) }
             var trackState by remember { mutableStateOf(Media3TrackState()) }
             var metadataState by remember { mutableStateOf(Media3UiMetadataState()) }
             var showAudioDialog by remember { mutableStateOf(false) }
@@ -125,7 +127,9 @@ class Media3PlayerActivity : ComponentActivity() {
 
             LaunchedEffect(Unit) {
                 while (true) {
-                    uiState = Media3UiState.fromMap(Media3Bridge.activeState())
+                    val playerState = Media3Bridge.activeState()
+                    uiState = Media3UiState.fromMap(playerState)
+                    diagnosticControls = playerState["diagnosticOverlay"] == true
                     trackState = Media3TrackState.fromMap(Media3Bridge.activeTracks())
                     metadataState = Media3UiMetadataState.fromMap(Media3Bridge.activeUiMetadata())
                     delay(250L)
@@ -184,6 +188,20 @@ class Media3PlayerActivity : ComponentActivity() {
                                 border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f)),
                             ) {
                                 Text("Back")
+                            }
+                            if (diagnosticControls) {
+                                TextButton(onClick = {
+                                    val state = Media3Bridge.activeState()
+                                    Media3Bridge.emitEvent(mapOf(
+                                        "event" to "performanceMarker",
+                                        "diagnosticGeneration" to state["diagnosticGeneration"],
+                                        "nativeUs" to android.os.SystemClock.elapsedRealtimeNanos() / 1000,
+                                        "positionMs" to state["positionMs"],
+                                    ))
+                                    diagnosticMarks++
+                                }) {
+                                    Text(if (diagnosticMarks == 0) "Mark slow" else "Marked $diagnosticMarks", color = Color.White)
+                                }
                             }
                             Column(
                                 modifier = Modifier

@@ -38,6 +38,17 @@ typedef LoadingErrorWidgetBuilder = Widget Function(
 
 /// Image widget to show NetworkImage with caching functionality.
 class CachedNetworkImage extends StatelessWidget {
+  /// Optional observer of the existing image pipeline; never starts a fetch or
+  /// attaches another image-stream listener. Consumers must sanitize keys.
+  static void Function(String stage, String key, int? width, int? height)?
+      performanceObserver;
+
+  void _observe(String stage) {
+    try {
+      performanceObserver?.call(stage, imageUrl, memCacheWidth, memCacheHeight);
+    } catch (_) {/* Diagnostics must not affect image rendering. */}
+  }
+
   /// Get the current log level of the cache manager.
   static CacheManagerLogLevel get logLevel => CacheManager.logLevel;
 
@@ -256,6 +267,7 @@ class CachedNetworkImage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    _observe('requested');
     var octoPlaceholderBuilder =
         placeholder != null ? _octoPlaceholderBuilder : null;
     final octoProgressIndicatorBuilder =
@@ -271,7 +283,9 @@ class CachedNetworkImage extends StatelessWidget {
 
     return OctoImage(
       image: _image,
-      imageBuilder: imageBuilder != null ? _octoImageBuilder : null,
+      imageBuilder: imageBuilder != null || performanceObserver != null
+          ? _octoImageBuilder
+          : null,
       placeholderBuilder: octoPlaceholderBuilder,
       progressIndicatorBuilder: octoProgressIndicatorBuilder,
       errorBuilder: errorWidget != null ? _octoErrorBuilder : null,
@@ -296,7 +310,24 @@ class CachedNetworkImage extends StatelessWidget {
   }
 
   Widget _octoImageBuilder(BuildContext context, Widget child) {
-    return imageBuilder!(context, _image);
+    if (performanceObserver != null) {
+      _observe('ready');
+      final observer = performanceObserver;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        try {
+          if (!context.mounted || observer != performanceObserver) return;
+          final box = context.findRenderObject();
+          if (box is! RenderBox || !box.attached || !box.hasSize) return;
+          final view = View.of(context);
+          final viewport =
+              Offset.zero & (view.physicalSize / view.devicePixelRatio);
+          final bounds = box.localToGlobal(Offset.zero) & box.size;
+          // Bounds overlap is a visibility estimate, not an occlusion test.
+          if (bounds.overlaps(viewport)) _observe('painted_in_viewport');
+        } catch (_) {/* The element may have been deactivated this frame. */}
+      });
+    }
+    return imageBuilder?.call(context, _image) ?? child;
   }
 
   Widget _octoPlaceholderBuilder(BuildContext context) {
@@ -325,6 +356,7 @@ class CachedNetworkImage extends StatelessWidget {
     Object error,
     StackTrace? stackTrace,
   ) {
+    _observe('error');
     return errorWidget!(context, imageUrl, error);
   }
 }

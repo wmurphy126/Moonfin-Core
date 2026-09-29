@@ -1,3 +1,5 @@
+import '../../data/services/performance_recorder.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:get_it/get_it.dart';
 import 'package:playback_core/playback_core.dart';
@@ -372,6 +374,10 @@ void registerPlaybackModule() {
   // the last phase in a report names the stage that never finished.
   var lastBringupPhase = PlaybackBringupPhase.idle;
   manager.bringupStateStream.listen((state) {
+    final diagnosticItem = manager.queueService.currentItem;
+    PerformanceRecorder.instance.bringup(state,
+        isPreroll: diagnosticItem is AggregatedItem &&
+            diagnosticItem.rawData['__moonfinIsPreroll'] == true);
     if (state.phase == lastBringupPhase) return;
     lastBringupPhase = state.phase;
     if (state.phase == PlaybackBringupPhase.idle) return;

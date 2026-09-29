@@ -24,7 +24,11 @@ class SearchResultGroup {
   });
 
   SearchResultGroup copyWith({List<AggregatedItem>? items}) =>
-      SearchResultGroup(title: title, itemTypes: itemTypes, items: items ?? this.items);
+      SearchResultGroup(
+        title: title,
+        itemTypes: itemTypes,
+        items: items ?? this.items,
+      );
 }
 
 /// A single retro game that matched the query. Games live behind the Moonbase
@@ -55,10 +59,9 @@ class SearchViewModel extends ChangeNotifier {
     MultiServerRepository? multiServerRepository,
   }) : _seerrRepository = seerrRepository,
        _multiServerRepository = multiServerRepository,
-       _scopedParentId =
-           (scopedParentId != null && scopedParentId.isNotEmpty)
-               ? scopedParentId
-               : null;
+       _scopedParentId = (scopedParentId != null && scopedParentId.isNotEmpty)
+           ? scopedParentId
+           : null;
 
   void setSeerrRepository(SeerrRepository repo) {
     _seerrRepository = repo;
@@ -118,7 +121,10 @@ class SearchViewModel extends ChangeNotifier {
       SearchResultGroup(title: l10n.seasons, itemTypes: const ['Season']),
       SearchResultGroup(title: l10n.episodes, itemTypes: const ['Episode']),
       SearchResultGroup(title: l10n.videos, itemTypes: const ['Video']),
-      SearchResultGroup(title: l10n.musicVideos, itemTypes: const ['MusicVideo']),
+      SearchResultGroup(
+        title: l10n.musicVideos,
+        itemTypes: const ['MusicVideo'],
+      ),
       SearchResultGroup(title: l10n.trailers, itemTypes: const ['Trailer']),
       SearchResultGroup(title: l10n.programs, itemTypes: const ['Program']),
       SearchResultGroup(
@@ -132,7 +138,10 @@ class SearchViewModel extends ChangeNotifier {
       ),
       SearchResultGroup(title: l10n.albums, itemTypes: const ['MusicAlbum']),
       SearchResultGroup(title: l10n.songs, itemTypes: const ['Audio']),
-      SearchResultGroup(title: l10n.photoAlbums, itemTypes: const ['PhotoAlbum']),
+      SearchResultGroup(
+        title: l10n.photoAlbums,
+        itemTypes: const ['PhotoAlbum'],
+      ),
       SearchResultGroup(title: l10n.photos, itemTypes: const ['Photo']),
       SearchResultGroup(title: l10n.collections, itemTypes: const ['BoxSet']),
       SearchResultGroup(title: l10n.people, itemTypes: const ['Person']),
@@ -178,29 +187,44 @@ class SearchViewModel extends ChangeNotifier {
     _executeSearch(trimmed);
   }
 
-  Future<void> _executeSearch(String query) async {
+  Future<void> _executeSearch(String query) => PerformanceTrace.measure(
+    'search.execute',
+    () => _executeSearchRecorded(query),
+  );
+
+  Future<void> _executeSearchRecorded(String query) async {
+    PerformanceTrace.observed(this, 'search');
     if (query != _query) return;
 
     try {
-        final activeGroups = _scopedParentId != null
+      final activeGroups = _scopedParentId != null
           ? _bookSearchGroups()
           : _searchGroups();
-      final seerrFuture = _fetchSeerrResults(query);
+      final seerrFuture = PerformanceTrace.measure(
+        'search.seerr',
+        () => _fetchSeerrResults(query),
+      );
       final gamesFuture = _scopedParentId != null
           ? Future.value(const <GameSearchResult>[])
-          : _fetchGameResults(query);
+          : PerformanceTrace.measure(
+              'search.games',
+              () => _fetchGameResults(query),
+            );
 
       final groups = _scopedParentId != null
-          ? await Future.wait(activeGroups.map((group) async {
-              final items = await _searchRepository.search(
-                query,
-                includeItemTypes: group.itemTypes,
-                parentId: _scopedParentId,
-                limit: _resultLimit,
-              );
-              return group.copyWith(items: items);
-            }))
+          ? await Future.wait(
+              activeGroups.map((group) async {
+                final items = await _searchRepository.search(
+                  query,
+                  includeItemTypes: group.itemTypes,
+                  parentId: _scopedParentId,
+                  limit: _resultLimit,
+                );
+                return group.copyWith(items: items);
+              }),
+            )
           : await _buildGroupedGlobalResults(query, activeGroups);
+      PerformanceTrace.event('search.library.ready', {'groups': groups.length});
       final seerr = await seerrFuture;
       final games = await gamesFuture;
 
@@ -210,6 +234,11 @@ class SearchViewModel extends ChangeNotifier {
       _seerrResults = seerr;
       _gameResults = games;
       _state = SearchState.ready;
+      PerformanceTrace.event('search.data.ready', {
+        'groups': _results.length,
+        'seerr': seerr.length,
+        'games': games.length,
+      });
     } catch (e) {
       if (query != _query) return;
       _error = e;
@@ -226,7 +255,10 @@ class SearchViewModel extends ChangeNotifier {
     // instead of looking the servers up again.
     final sessions = await _multiServerRepository?.getLoggedInServers();
     _serverNames = sessions != null && sessions.length > 1
-        ? {for (final session in sessions) session.server.id: session.server.name}
+        ? {
+            for (final session in sessions)
+              session.server.id: session.server.name,
+          }
         : const {};
     final peopleFuture = _searchEachServer(
       (repository) => repository.searchPeople(query, limit: _resultLimit),
@@ -275,7 +307,9 @@ class SearchViewModel extends ChangeNotifier {
 
   /// Takes one result from each server in turn, so every server keeps its own
   /// ranking and none crowds the others out of a capped group.
-  static List<AggregatedItem> _interleave(List<List<AggregatedItem>> perServer) {
+  static List<AggregatedItem> _interleave(
+    List<List<AggregatedItem>> perServer,
+  ) {
     final longest = perServer.fold(0, (most, items) => max(most, items.length));
     return [
       for (var i = 0; i < longest; i++)
@@ -365,6 +399,7 @@ class SearchViewModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    PerformanceTrace.disposed(this, 'search');
     _debounceTimer?.cancel();
     super.dispose();
   }

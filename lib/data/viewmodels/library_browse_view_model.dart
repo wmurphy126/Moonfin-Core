@@ -525,7 +525,11 @@ class LibraryBrowseViewModel extends ChangeNotifier {
     _posterSize = _readScopedPosterSize();
   }
 
-  Future<void> load() async {
+  Future<void> load() =>
+      PerformanceTrace.measure('library.load', _loadRecorded);
+
+  Future<void> _loadRecorded() async {
+    PerformanceTrace.observed(this, 'library');
     // Any page walk still running belongs to the list we are about to drop.
     _pageWalkGeneration++;
     _state = LibraryBrowseState.loading;
@@ -544,7 +548,7 @@ class LibraryBrowseViewModel extends ChangeNotifier {
       // adding a third round trip before the first item can render.
       final imageTypeSync = _imageTypeSynced
           ? Future<void>.value()
-          : _syncImageTypeFromServer().then((_) => _imageTypeSynced = true);
+          : PerformanceTrace.measure('library.preferences', _syncImageTypeFromServer).then((_) => _imageTypeSynced = true);
 
       if (isFilterBrowse) {
         _libraryName = overrideName ?? '';
@@ -555,8 +559,8 @@ class LibraryBrowseViewModel extends ChangeNotifier {
         if (_libraries.isEmpty) _loadLibraries();
         if (libraryId.isNotEmpty) {
           try {
-            final parentData = await _client.itemsApi
-                .getItem(libraryId, fields: _libraryMetaFields);
+            final parentData = await PerformanceTrace.measure('library.metadata', () => _client.itemsApi
+                .getItem(libraryId, fields: _libraryMetaFields));
             _collectionType = (parentData['CollectionType'] as String?)
                 ?.toLowerCase();
           } catch (_) {}
@@ -564,8 +568,8 @@ class LibraryBrowseViewModel extends ChangeNotifier {
       }
       if (!isFilterBrowse && !_libraryMetaResolved && libraryId.isNotEmpty) {
         try {
-          final parentData = await _client.itemsApi
-              .getItem(libraryId, fields: _libraryMetaFields);
+          final parentData = await PerformanceTrace.measure('library.metadata', () => _client.itemsApi
+              .getItem(libraryId, fields: _libraryMetaFields));
           _libraryName = parentData['Name'] as String? ?? '';
           _collectionType = (parentData['CollectionType'] as String?)
               ?.toLowerCase();
@@ -598,8 +602,9 @@ class LibraryBrowseViewModel extends ChangeNotifier {
       _refreshPosterSizeFromScope();
 
       await imageTypeSync;
-      await _fetchPage(0);
+      await PerformanceTrace.measure('library.page', () => _fetchPage(0));
       _state = LibraryBrowseState.ready;
+      PerformanceTrace.event('library.data.ready', {'items': _items.length});
     } catch (e) {
       _error = e;
       _isNetworkError = isNetworkException(e);
@@ -611,7 +616,12 @@ class LibraryBrowseViewModel extends ChangeNotifier {
     }
   }
 
-  Future<void> ensureAllItemsLoaded() async {
+  Future<void> ensureAllItemsLoaded() => PerformanceTrace.measure(
+    'library.full_walk',
+    _ensureAllItemsLoadedRecorded,
+  );
+
+  Future<void> _ensureAllItemsLoadedRecorded() async {
     final generation = ++_pageWalkGeneration;
     bool stillWanted() =>
         !_disposed && _pageWalkGeneration == generation;
@@ -1800,6 +1810,8 @@ class LibraryBrowseViewModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    PerformanceTrace.disposed(this, 'library');
+    PerformanceTrace.event('library.disposed', {'items': _items.length});
     // Also stops an in-flight page walk from fetching what nobody will see.
     _disposed = true;
     _searchDebounceTimer?.cancel();
