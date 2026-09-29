@@ -39,10 +39,14 @@ resolve_flutter() {
 }
 
 FLUTTER="$(resolve_flutter)"
+BUILD_SOURCE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 
 VERSION_LINE=$(grep '^version:' "$REPO_ROOT/pubspec.yaml" | sed 's/version:[[:space:]]*//' | tr -d '[:space:]')
 APP_VERSION=$(printf '%s' "$VERSION_LINE" | cut -d'+' -f1)
 APP_BUILD_NUMBER=$(printf '%s' "$VERSION_LINE" | cut -d'+' -f2)
+if [ -n "${MOONFIN_TEST_ID_SUFFIX:-}" ] && [ -n "${MOONFIN_ANDROID_TEST_BUILD_NUMBER:-}" ]; then
+  APP_BUILD_NUMBER="$MOONFIN_ANDROID_TEST_BUILD_NUMBER"
+fi
 if [ -z "$APP_VERSION" ] || [ -z "$APP_BUILD_NUMBER" ]; then
   echo "Error: could not read semantic version and build number from pubspec.yaml (expected x.y.z+build)" >&2
   exit 1
@@ -77,6 +81,7 @@ echo "Building Android release APK (arm64-v8a, armeabi-v7a, x86_64)..."
   --flavor mobile \
   --build-name "$APP_VERSION" \
   --build-number "$APP_BUILD_NUMBER" \
+  --dart-define=MOONFIN_GIT_SHA="$BUILD_SOURCE_SHA" \
   --dart-define=DISTRIBUTION_CHANNEL=apk
 
 if [ ! -f "$APK_SOURCE" ]; then
@@ -94,11 +99,18 @@ fi
 echo "APK created: $APK_SOURCE"
 echo "APK copied to root: $APK_OUTPUT"
 
+# Device-testing runs only need the installable mobile APK. Normal release
+# builds still produce both flavors and both distribution formats below.
+if [ "${MOONFIN_ANDROID_APK_ONLY:-false}" = "true" ]; then
+  exit 0
+fi
+
 echo "Building Android App Bundle..."
 if ! "$FLUTTER" build appbundle --release \
   --flavor mobile \
   --build-name "$APP_VERSION" \
   --build-number "$APP_BUILD_NUMBER" \
+  --dart-define=MOONFIN_GIT_SHA="$BUILD_SOURCE_SHA" \
   --dart-define=DISTRIBUTION_CHANNEL=aab; then
   echo "Flutter appbundle build failed. Retrying with Gradle bundleRelease fallback..."
   (
@@ -127,6 +139,7 @@ echo "Building Android TV release APK..."
   --flavor androidTv \
   --build-name "$TV_VERSION" \
   --build-number "$TV_BUILD_NUMBER" \
+  --dart-define=MOONFIN_GIT_SHA="$BUILD_SOURCE_SHA" \
   --dart-define=MOONFIN_FORCE_TV=true \
   --dart-define=DISTRIBUTION_CHANNEL=android_tv_apk
 
@@ -150,6 +163,7 @@ if ! "$FLUTTER" build appbundle --release \
   --flavor androidTv \
   --build-name "$TV_VERSION" \
   --build-number "$TV_BUILD_NUMBER" \
+  --dart-define=MOONFIN_GIT_SHA="$BUILD_SOURCE_SHA" \
   --dart-define=MOONFIN_FORCE_TV=true \
   --dart-define=DISTRIBUTION_CHANNEL=android_tv_aab; then
   echo "Flutter appbundle build failed. Retrying with Gradle bundleAndroidTvRelease fallback..."
