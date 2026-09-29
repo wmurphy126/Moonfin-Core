@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:dio/dio.dart';
 import 'package:get_it/get_it.dart';
@@ -121,7 +122,7 @@ class LibraryBrowseViewModel extends ChangeNotifier {
   bool _hasMoreFromPageSize = false;
 
   bool get hasMore =>
-      _totalCountKnown ? _items.length < _totalCount : _hasMoreFromPageSize;
+      !_refreshing && (_totalCountKnown ? _items.length < _totalCount : _hasMoreFromPageSize);
 
   String _libraryName = '';
   String get libraryName => _libraryName;
@@ -245,6 +246,8 @@ class LibraryBrowseViewModel extends ChangeNotifier {
 
   int _pageWalkGeneration = 0;
   bool _disposed = false;
+  RequestWorkScope? _requestScope;
+  int _loadGeneration = 0;
 
   // Grouping walks every item and sorts the keys, and the grid asks for it
   // more than once per build.
@@ -525,16 +528,43 @@ class LibraryBrowseViewModel extends ChangeNotifier {
     _posterSize = _readScopedPosterSize();
   }
 
-  Future<void> load() =>
-      PerformanceTrace.measure('library.load', _loadRecorded);
+  bool _refreshing = false;
+  bool get isRefreshing => _refreshing;
+  String? _successfulQuery;
+  Future<void>? _imageTypeSyncPending;
+  int _imagePreferenceRevision = 0;
+
+  // Keep old rows only for this exact account, library, ordering and filters.
+  String get _queryIdentity => jsonEncode([
+    _client.baseUrl, _client.userId, libraryId, genreId, studioName,
+    includeItemTypes, _libraryFilter, _sortBy.name, _sortDirection.name,
+    _playedFilter.name, _likedFilter.name, _seriesFilter.name, _favoriteFilter,
+    for (final values in [_featureFilters, _videoQualityFilters, _videoSourceFilters,
+      _genreFilters, _officialRatingFilters, _tagFilters, _yearFilters,
+      _audioLanguageFilters, _subtitleLanguageFilters])
+      (values.map((e) => e.toString()).toList()..sort()),
+    _prefs.get(UserPreferences.blockedParentalRatings), _lastGroupCollectionsValue,
+  ]);
+
+  Future<void> load() {
+    if (_disposed) return Future.value();
+    _requestScope?.cancel();
+    _requestScope = RequestWorkScope();
+    return _requestScope!.run(() => PerformanceTrace.measure('library.load', _loadRecorded));
+  }
 
   Future<void> _loadRecorded() async {
+    if (_disposed) return;
+    final generation = ++_loadGeneration;
+    bool current() => !_disposed && generation == _loadGeneration;
     PerformanceTrace.observed(this, 'library');
     // Any page walk still running belongs to the list we are about to drop.
     _pageWalkGeneration++;
-    _state = LibraryBrowseState.loading;
-    _items = const [];
-    _totalCount = 0;
+    _loadingMore = false;
+    final retainRows = _items.isNotEmpty && _successfulQuery == _queryIdentity;
+    _refreshing = retainRows;
+    _state = retainRows ? LibraryBrowseState.ready : LibraryBrowseState.loading;
+    if (!retainRows) { _items = const []; _totalCount = 0; }
     _filteredOutCount = 0;
     _fetchedCount = 0;
     _renderedItemIds.clear();
@@ -548,7 +578,7 @@ class LibraryBrowseViewModel extends ChangeNotifier {
       // adding a third round trip before the first item can render.
       final imageTypeSync = _imageTypeSynced
           ? Future<void>.value()
-          : PerformanceTrace.measure('library.preferences', _syncImageTypeFromServer).then((_) => _imageTypeSynced = true);
+          : (_imageTypeSyncPending ??= RequestWorkScope.detached(() => PerformanceTrace.measure('library.preferences', _syncImageTypeFromServer)).then((_) { _imageTypeSynced = true; }).whenComplete(() => _imageTypeSyncPending = null));
 
       if (isFilterBrowse) {
         _libraryName = overrideName ?? '';
@@ -601,14 +631,22 @@ class LibraryBrowseViewModel extends ChangeNotifier {
 
       _refreshPosterSizeFromScope();
 
-      await imageTypeSync;
+      unawaited(imageTypeSync.then((_) {
+        if (current()) notifyListeners();
+      }));
+      if (!current()) return;
       await PerformanceTrace.measure('library.page', () => _fetchPage(0));
+      if (!current()) return;
+      _refreshing = false;
+      _successfulQuery = _queryIdentity;
       _state = LibraryBrowseState.ready;
       PerformanceTrace.event('library.data.ready', {'items': _items.length});
     } catch (e) {
+      if (!current()) return;
       _error = e;
       _isNetworkError = isNetworkException(e);
-      _state = LibraryBrowseState.error;
+      _refreshing = false;
+      _state = retainRows ? LibraryBrowseState.ready : LibraryBrowseState.error;
     }
     notifyListeners();
     if (isGrouping || _prefs.get(UserPreferences.showAlphabeticalFilters)) {
@@ -671,13 +709,17 @@ class LibraryBrowseViewModel extends ChangeNotifier {
   }
 
   Future<void> loadMore({int? pageSizeOverride, bool notify = true}) async {
-    if (_loadingMore || !hasMore) return;
+    if (_disposed || _loadingMore || !hasMore) return;
+    final generation = _loadGeneration;
     _loadingMore = true;
     if (notify) notifyListeners();
 
     final previouslyFetched = _fetchedCount;
     try {
-      await _fetchPage(_fetchedCount, pageSizeOverride: pageSizeOverride);
+      final scope = _requestScope;
+      if (scope == null || scope.isCanceled) return;
+      await scope.run(() => _fetchPage(_fetchedCount, pageSizeOverride: pageSizeOverride));
+      if (_disposed || generation != _loadGeneration) return;
       // Stop on a page the server had nothing left for, not on one that only
       // repeated what is already shown, which a random sort does by chance.
       if (_fetchedCount <= previouslyFetched) {
@@ -686,11 +728,14 @@ class LibraryBrowseViewModel extends ChangeNotifier {
       }
     } catch (_) {}
 
+    if (_disposed || generation != _loadGeneration) return;
     _loadingMore = false;
     if (notify) notifyListeners();
   }
 
   Future<void> _fetchPage(int startIndex, {int? pageSizeOverride}) async {
+    final generation = _loadGeneration;
+    bool current() => !_disposed && generation == _loadGeneration;
     final pageSize = pageSizeOverride ?? (startIndex == 0 ? _firstPageSize : _pageSize);
     final filters = <String>[];
     if (_playedFilter == PlayedStatusFilter.watched) {
@@ -924,6 +969,7 @@ class LibraryBrowseViewModel extends ChangeNotifier {
     // Counted for every browse, not just playlists. A dropped item is gone for
     // good, so the total has to shrink with it or the grid keeps asking for
     // pages that will never arrive.
+    if (!current()) return;
     _filteredOutCount += mapped.length - filtered.length;
 
     // A playlist is free to list the same item more than once, so only the
@@ -943,10 +989,10 @@ class LibraryBrowseViewModel extends ChangeNotifier {
     _totalCountKnown = totalFromServer != null;
     if (_totalCountKnown) {
       _totalCount = totalFromServer! - _filteredOutCount;
-      _hasMoreFromPageSize = _items.length + filtered.length < _totalCount;
+      _hasMoreFromPageSize = (startIndex == 0 ? 0 : _items.length) + filtered.length < _totalCount;
     } else {
       _hasMoreFromPageSize = rawItems.length == pageSize;
-      final loadedCount = _items.length + filtered.length;
+      final loadedCount = (startIndex == 0 ? 0 : _items.length) + filtered.length;
       _totalCount = loadedCount + (_hasMoreFromPageSize ? 1 : 0);
     }
 
@@ -1475,6 +1521,7 @@ class LibraryBrowseViewModel extends ChangeNotifier {
 
   Future<void> setImageType(ImageType value) async {
     if (_imageType == value) return;
+    _imagePreferenceRevision++;
     _imageType = value;
     await _prefs.set(UserPreferences.libraryImageType(_imagePrefKey), value);
     notifyListeners();
@@ -1483,11 +1530,13 @@ class LibraryBrowseViewModel extends ChangeNotifier {
 
   Future<void> _syncImageTypeFromServer() async {
     if (_imagePrefKey.isEmpty) return;
+    final revision = _imagePreferenceRevision;
     try {
       final dp = await _client.displayPreferencesApi.getDisplayPreferences(
         _imagePrefKey,
         client: 'moonfin',
       );
+      if (_disposed || revision != _imagePreferenceRevision) return;
       final serverType = dp.customPrefs['imageType'];
       if (serverType != null) {
         final match = ImageType.values.where(
@@ -1814,6 +1863,8 @@ class LibraryBrowseViewModel extends ChangeNotifier {
     PerformanceTrace.event('library.disposed', {'items': _items.length});
     // Also stops an in-flight page walk from fetching what nobody will see.
     _disposed = true;
+    _requestScope?.cancel();
+    _loadGeneration++;
     _searchDebounceTimer?.cancel();
     _pageWalkGeneration++;
     _prefs.removeListener(_onPrefsChanged);

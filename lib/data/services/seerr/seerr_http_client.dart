@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:get_it/get_it.dart';
-import 'package:server_core/server_core.dart' show PerformanceInterceptor, PerformanceTimingAdapter;
+import 'package:server_core/server_core.dart' show PerformanceInterceptor, PerformanceTimingAdapter, RequestScopeInterceptor;
 
 import '../log_service.dart';
 import 'seerr_error.dart';
@@ -47,6 +47,7 @@ class SeerrHttpClient {
     ));
     _dio.httpClientAdapter = PerformanceTimingAdapter(_dio.httpClientAdapter);
     _dio.interceptors.add(_ProxyUnwrapInterceptor());
+    _dio.interceptors.add(RequestScopeInterceptor());
     _dio.interceptors.add(PerformanceInterceptor());
   }
 

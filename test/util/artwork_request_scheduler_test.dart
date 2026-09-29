@@ -226,4 +226,16 @@ void main() {
       expect(seen?.batch, 1);
     });
   });
+  test('an aged speculative lane cannot starve behind fresh hero requests', () {
+    run((async, s) {
+      want(s, 'active'); want(s, 'old-prefetch', priority: ImageFetchPriority.low);
+      async.elapse(const Duration(seconds: 6));
+      want(s, 'new-hero', priority: ImageFetchPriority.high);
+      s.release(); async.flushMicrotasks();
+      expect(order, ['active', 'old-prefetch']);
+      s.release(); async.flushMicrotasks();
+      expect(order.last, 'new-hero');
+    });
+  });
+
 }

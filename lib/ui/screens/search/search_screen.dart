@@ -72,7 +72,7 @@ class _SearchScreenState extends State<SearchScreen>
   final Map<String, FocusNode> _allRowNodes = <String, FocusNode>{};
   // Per-row keys so focusing a card can scroll its whole row (title included)
   // into view rather than just the card.
-  final Map<int, GlobalKey> _allRowKeys = <int, GlobalKey>{};
+  final Map<String, GlobalKey> _allRowKeys = <String, GlobalKey>{};
   // The results tab pill is a single focus stop.
   final _tabsFocusNode = FocusNode(debugLabel: 'search_tabs');
   // Vertical focus model: search field, then the tabs pill. Rebuilt each build.
@@ -85,6 +85,7 @@ class _SearchScreenState extends State<SearchScreen>
   List<String> _recentSearches = const [];
   static const _tmdbPosterBase = 'https://image.tmdb.org/t/p/w342';
   int _selectedTab = 0;
+  String _selectedTabIdentity = 'all';
   String? _tabSelectionQuery;
   bool _focusTabsAfterResults = false;
   bool _applyingRemoteSearch = false;
@@ -173,14 +174,22 @@ class _SearchScreenState extends State<SearchScreen>
 
   void _onViewModelChanged() {
     final query = _searchController.text.trim();
+    final identities = [if (_hasSeerr) 'seerr', if (_hasGames) 'games', 'all',
+      for (final group in _vm.results) group.itemTypes.join(',')];
+    if (query == _tabSelectionQuery) {
+      final selected = identities.indexOf(_selectedTabIdentity);
+      if (selected >= 0) _selectedTab = selected;
+    }
     if (_tabCount > 0 && query != _tabSelectionQuery) {
       _tabSelectionQuery = query;
+      _selectedTabIdentity = 'all';
       _selectedTab = _leadingTabCount;
     } else if (_selectedTab >= _tabCount) {
       _selectedTab = _tabCount == 0 ? 0 : _leadingTabCount;
     }
     if (_focusTabsAfterResults && _tabCount > 0) {
       _focusTabsAfterResults = false;
+      _selectedTabIdentity = 'all';
       _selectedTab = _leadingTabCount;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && _tabsFocusNode.canRequestFocus) {
@@ -188,8 +197,38 @@ class _SearchScreenState extends State<SearchScreen>
         }
       });
     }
+    _pruneAllRowFocus();
     _maybeBumpGridVersion();
     if (mounted) setState(() {});
+  }
+
+  bool _prunePending = false;
+  void _pruneAllRowFocus() {
+    if (_prunePending) return;
+    _prunePending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _prunePending = false;
+      if (!mounted) return;
+      final rows = <String>{};
+      final items = <String>{};
+      for (final group in _vm.results) {
+        final row = group.itemTypes.join(',');
+        rows.add(row);
+        for (final item in group.items) { items.add('$row:${item.serverId}:${item.id}'); }
+      }
+      if (_hasSeerr) {
+        rows.add('seerr');
+        for (final item in _vm.seerrResults) { items.add('seerr:${item.mediaType}:${item.id}'); }
+      }
+      if (_hasGames) {
+        rows.add('games');
+        for (final item in _vm.gameResults) { items.add('games:${item.libraryId}:${item.game.id}'); }
+      }
+      for (final key in _allRowNodes.keys.where((key) => !items.contains(key)).toList()) {
+        _allRowNodes.remove(key)?.dispose();
+      }
+      _allRowKeys.removeWhere((key, _) => !rows.contains(key));
+    });
   }
 
   // Detect when the current grid tab's content changed (async results arriving)
@@ -227,7 +266,7 @@ class _SearchScreenState extends State<SearchScreen>
     final gi = _groupIndex(_selectedTab);
     if (gi >= 0 && gi < _vm.results.length) {
       final items = _vm.results[gi].items;
-      return items.isEmpty ? null : items.first.id;
+      return items.isEmpty ? null : (items.first.serverId, items.first.id);
     }
     return null;
   }
@@ -340,6 +379,8 @@ class _SearchScreenState extends State<SearchScreen>
 
   void _selectTab(int index) {
     if (index == _selectedTab) return;
+    _selectedTabIdentity = _tabIsAll(index) ? 'all' : _tabIsSeerr(index) ? 'seerr' :
+        _tabIsGames(index) ? 'games' : _vm.results[_groupIndex(index)].itemTypes.join(',');
     setState(() => _selectedTab = index);
     cleanupGridFocusNodes(_currentTabItemCount());
     _lastGridCount = -1;
@@ -1029,7 +1070,7 @@ class _SearchScreenState extends State<SearchScreen>
       case SearchState.idle:
         return const SizedBox.shrink();
       case SearchState.loading:
-        if (_vm.results.isEmpty) {
+        if (_vm.results.isEmpty && _vm.seerrResults.isEmpty && _vm.gameResults.isEmpty) {
           return const SkeletonLibraryGrid(
             aspectRatio: 2 / 3,
             itemCount: 18,
@@ -1037,7 +1078,7 @@ class _SearchScreenState extends State<SearchScreen>
         }
         return _buildResults();
       case SearchState.ready
-          when _vm.results.isEmpty && _vm.seerrResults.isEmpty:
+          when _vm.results.isEmpty && _vm.seerrResults.isEmpty && _vm.gameResults.isEmpty:
         return Center(
           child: Text(
             AppLocalizations.of(context).noResultsForQuery(_vm.query),
@@ -1133,26 +1174,43 @@ class _SearchScreenState extends State<SearchScreen>
   }
 
   FocusNode _allCardNode(int row, int col) => _allRowNodes.putIfAbsent(
-    '$row:$col',
+    '${_allRowIdentity(row)}:${_allItemIdentity(row, col)}',
     () => FocusNode(debugLabel: 'search_all_$row:$col'),
   );
 
+  String _allRowIdentity(int row) => row < _vm.results.length
+      ? _vm.results[row].itemTypes.join(',')
+      : row == _vm.results.length && _hasSeerr ? 'seerr' : 'games';
+
+  String _allItemIdentity(int row, int col) {
+    if (row < _vm.results.length) {
+      final item = _vm.results[row].items[col];
+      return '${item.serverId}:${item.id}';
+    }
+    if (_allRowIdentity(row) == 'seerr') {
+      final item = _vm.seerrResults[col];
+      return '${item.mediaType}:${item.id}';
+    }
+    final item = _vm.gameResults[col];
+    return '${item.libraryId}:${item.game.id}';
+  }
+
   GlobalKey _allRowKey(int row) =>
-      _allRowKeys.putIfAbsent(row, () => GlobalKey());
+      _allRowKeys.putIfAbsent(_allRowIdentity(row), () => GlobalKey());
 
   void _focusAllCard(int row, int col, {bool changedRow = true}) {
     final node = _allCardNode(row, col);
+    final rowKey = _allRowKey(row);
     if (node.context != null) {
       node.requestFocus();
       _ensureAllCardVisible(row, node, changedRow: changedRow);
       return;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final target = _allCardNode(row, col);
-      if (target.canRequestFocus) {
-        target.requestFocus();
-        _ensureAllCardVisible(row, target, changedRow: changedRow);
+      if (!mounted || !_allRowNodes.containsValue(node)) return;
+      if (node.canRequestFocus) {
+        node.requestFocus();
+        _ensureAllCardVisible(row, node, changedRow: changedRow, rowKey: rowKey);
       }
     });
   }
@@ -1164,13 +1222,14 @@ class _SearchScreenState extends State<SearchScreen>
     int row,
     FocusNode node, {
     required bool changedRow,
+    GlobalKey? rowKey,
   }) {
     final cardContext = node.context;
     if (cardContext != null) {
       _revealInNearestScrollable(cardContext, alignment: 0.5);
     }
     if (!changedRow) return;
-    final rowContext = _allRowKey(row).currentContext;
+    final rowContext = (rowKey ?? _allRowKey(row)).currentContext;
     if (rowContext != null) {
       unawaited(
         Scrollable.ensureVisible(

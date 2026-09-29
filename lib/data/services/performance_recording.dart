@@ -394,3 +394,23 @@ class _Aggregate {
     return 'n=$count mean=${(sum / count / 1000).toStringAsFixed(1)} recentP95=${(p95 / 1000).toStringAsFixed(1)} max=${(max / 1000).toStringAsFixed(1)} fullRunBucketsMs=${boundsMs.join('/')}/overflow counts=${histogram.join('/')}';
   }
 }
+
+/// Differences are meaningful only inside one decoder/source epoch. A seek can
+/// intentionally skip frames; the caller records whether a seek was active.
+Map<String, Object?> decoderCounterDeltas(
+  Map<String, Object?> current, Map<String, Object?>? previous,
+) {
+  if (previous == null || current['player'] == null || current['decoderEpoch'] == null ||
+      current['player'] != previous['player'] || current['decoderEpoch'] != previous['decoderEpoch']) {
+    return {'deltaValid': false};
+  }
+  final at = current['nativeUs'], before = previous['nativeUs'];
+  if (at is! int || before is! int || at <= before) return {'deltaValid': false};
+  final result = <String, Object?>{'deltaValid': true, 'intervalUs': at - before};
+  for (final key in ['rendered', 'dropped', 'skipped']) {
+    final now = current[key], old = previous[key];
+    if (now is! int || old is! int || now < old) return {'deltaValid': false};
+    result['delta${key[0].toUpperCase()}${key.substring(1)}'] = now - old;
+  }
+  return result;
+}

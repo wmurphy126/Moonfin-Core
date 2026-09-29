@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -24,6 +25,7 @@ class _RecordingAdapter implements HttpClientAdapter {
 
   /// Body returned for the Resolved endpoint, replaceable per test.
   Map<String, dynamic> resolvedProfile = {};
+  final streams = <StreamController<Uint8List>>[];
 
   @override
   Future<ResponseBody> fetch(
@@ -34,6 +36,10 @@ class _RecordingAdapter implements HttpClientAdapter {
     final path = options.uri.path;
     requests.add('${options.method} $path');
 
+    if (path.endsWith('/Settings/Stream')) {
+      final stream = StreamController<Uint8List>(); streams.add(stream);
+      return ResponseBody(stream.stream, 200, headers: {'content-type': ['text/event-stream']});
+    }
     Map<String, dynamic>? body;
     if (path.endsWith('/Moonfin/Ping')) {
       body = {'installed': true, 'settingsSyncEnabled': true};
@@ -90,6 +96,7 @@ void main() {
     );
 
     client = _MockClient();
+    when(() => client.serverType).thenReturn(ServerType.jellyfin);
     when(() => client.baseUrl).thenReturn('http://plugin.test');
     when(() => client.accessToken).thenReturn('token');
     when(() => client.deviceInfo).thenReturn(
@@ -115,6 +122,8 @@ void main() {
   });
 
   tearDown(() async {
+    service.dispose();
+    for (final stream in adapter.streams) { if (!stream.isClosed) unawaited(stream.close()); }
     await GetIt.instance.reset();
   });
 
@@ -179,4 +188,29 @@ void main() {
     await service.pushSettingsForProfile(client, profile: 'desktop');
     expect(postCount(), 2);
   });
+  test('stream EOF backs off beyond headers and reset invalidates an old retry', () async {
+    await service.connectSettingsStreamForTesting(client);
+    expect(adapter.streams, hasLength(1));
+    await adapter.streams[0].close();
+    await Future<void>.delayed(const Duration(milliseconds: 1300));
+    expect(adapter.streams, hasLength(2));
+    await adapter.streams[1].close();
+    await Future<void>.delayed(const Duration(milliseconds: 1400));
+    expect(adapter.streams, hasLength(2));
+    await service.connectSettingsStreamForTesting(client);
+    expect(adapter.streams, hasLength(3));
+    await Future<void>.delayed(const Duration(milliseconds: 1300));
+    expect(adapter.streams, hasLength(3));
+    service.resetState();
+    await Future<void>.delayed(const Duration(milliseconds: 1300));
+    expect(adapter.streams, hasLength(3));
+  });
+  test('stream error followed by done schedules one reconnect', () async {
+    await service.connectSettingsStreamForTesting(client);
+    adapter.streams.single.addError(StateError('network interruption'));
+    await adapter.streams.single.close();
+    await Future<void>.delayed(const Duration(milliseconds: 1300));
+    expect(adapter.streams, hasLength(2));
+  });
+
 }

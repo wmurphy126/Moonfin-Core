@@ -12,6 +12,8 @@ import '../models/lyrics.dart';
 import '../models/tmdb_item_ref.dart';
 import '../services/blocked_content_gate.dart';
 import '../services/row_data_source.dart';
+import '../services/collection_membership_lookup.dart';
+import '../utils/bounded_concurrency.dart';
 import '../repositories/item_mutation_repository.dart';
 import '../repositories/mdblist_repository.dart';
 import '../repositories/tmdb_repository.dart';
@@ -297,11 +299,20 @@ class ItemDetailViewModel extends ChangeNotifier {
   bool get episodesLoaded => _episodesLoaded;
 
   List<AggregatedItem> _seriesEpisodes = const [];
+  Future<void>? _seriesEpisodesPending;
   bool _seriesEpisodesRequested = false;
+  int _episodeGeneration = 0;
+  Timer? _episodeRetryTimer;
+  Completer<bool>? _episodeRetryWaiter;
+  Object? seriesEpisodesError;
+  bool get seriesEpisodesApplicable => !_isSeerrOnly &&
+      !itemId.startsWith('tmdb:') && _item != null &&
+      ['Series', 'Season', 'Episode'].contains(_item!.type) &&
+      !(_item!.seriesId?.startsWith('tmdb:') ?? false);
   bool _seriesEpisodesLoaded = false;
 
   /// Whether [seriesEpisodes] has arrived. Unlike [seasonsLoaded] this only
-  /// turns true on a fetch that worked, because a failed one is tried again.
+  /// turns true on success; failures require a bounded or explicit retry.
   bool get seriesEpisodesLoaded => _seriesEpisodesLoaded;
 
   /// All episodes of a Series across every season, in the server's
@@ -457,6 +468,8 @@ class ItemDetailViewModel extends ChangeNotifier {
 
   final String? _serverId;
   bool _isDisposed = false;
+  final _secondaryScope = RequestWorkScope(priority: RequestPriority.background);
+  var _episodeScope = RequestWorkScope();
 
   /// The Seerr side of this title, when there is one. Null until the lookup
   /// lands, and null forever when Seerr is off or doesn't know the title.
@@ -549,13 +562,16 @@ class ItemDetailViewModel extends ChangeNotifier {
     final existing = _seerr;
     if (existing != null) return existing;
     final repo = await GetIt.instance.getAsync<SeerrRepository>();
+    if (_isDisposed) {
+      throw DioException.requestCancelled(requestOptions: RequestOptions(), reason: 'detail disposed');
+    }
+    // Concurrent metadata consumers can resume the same repository await.
+    // Only one child may own its poll timer and listener.
+    if (_seerr != null) return _seerr!;
     final created = SeerrMediaDetailViewModel(
       repo,
       GetIt.instance<SeerrPreferences>(),
     );
-    // Disposal races the await above, so hand back a child nobody listens to
-    // rather than wiring one into a dead view model.
-    if (_isDisposed) return created;
     created.addListener(notifyListeners);
     _seerr = created;
     return created;
@@ -696,6 +712,7 @@ class ItemDetailViewModel extends ChangeNotifier {
     );
     // Seerr owns the seasons here, so nothing goes looking for them on a server
     // that has never heard of this title.
+    _seriesEpisodesLoaded = true;
     _seasons = _seerrSeasons(state);
     _seasonsLoaded = true;
     _state = ItemDetailState.ready;
@@ -904,6 +921,12 @@ class ItemDetailViewModel extends ChangeNotifier {
   }
 
   Future<void> _loadSecondary() async {
+    if (_isDisposed) return;
+    try { await _secondaryScope.run(_loadSecondaryRecorded); }
+    on DioException catch (e) { if (e.type != DioExceptionType.cancel) rethrow; }
+  }
+
+  Future<void> _loadSecondaryRecorded() async {
     final type = _item?.type;
     final futures = <Future>[];
     // Deliberately outside the Future.wait below, so a slow Seerr server never
@@ -1028,50 +1051,91 @@ class ItemDetailViewModel extends ChangeNotifier {
   /// and the Spotlight More Episodes modal. No-op once already loaded.
   int _episodeDiagnosticAttempt = 0;
 
-  Future<void> loadAllSeriesEpisodes({String caller = 'unspecified'}) async {
+  Future<void> loadAllSeriesEpisodes({String caller = 'unspecified'}) {
+    if (_isDisposed || !seriesEpisodesApplicable) {
+      PerformanceTrace.event('details.episodes.skipped', {
+        'caller': caller, 'idKind': PerformanceTrace.identifierKind(itemId),
+        'reason': _isDisposed ? 'disposed' : 'not_applicable',
+      });
+      return Future.value();
+    }
+    if (_seriesEpisodesPending != null) return _seriesEpisodesPending!;
+    if (_seriesEpisodesRequested) return Future.value();
+    _seriesEpisodesRequested = true;
+    final generation = _episodeGeneration;
+    final seriesId = _item!.type == 'Series' ? itemId : _item!.seriesId;
+    if (seriesId == null || seriesId.isEmpty) return Future.value();
     final trace = PerformanceTrace.begin('details.episodes', {
-      'caller': caller,
-      'resource': PerformanceTrace.resource(this),
-      'idKind': PerformanceTrace.identifierKind(itemId),
-      'seerrOnly': _isSeerrOnly,
-      'alreadyRequested': _seriesEpisodesRequested,
-      'attempt': PerformanceTrace.enabled ? ++_episodeDiagnosticAttempt : 0,
+      'caller': caller, 'resource': PerformanceTrace.resource(this),
+      'idKind': PerformanceTrace.identifierKind(seriesId), 'seerrOnly': false,
+      'attempt': ++_episodeDiagnosticAttempt,
     });
-    return PerformanceTrace.within(trace, () => _loadAllSeriesEpisodesRecorded(trace));
+    late final Future<void> pending;
+    pending = _episodeScope.run(() => PerformanceTrace.within(trace, () async {
+      for (var attempt = 0; attempt < 2; attempt++) {
+        if (_isDisposed || generation != _episodeGeneration) {
+          trace?.end(outcome: 'canceled');
+          return;
+        }
+        try {
+          final data = await _client.itemsApi.getEpisodes(seriesId, fields: _episodeOverviewFields);
+          if (_isDisposed || generation != _episodeGeneration) {
+            trace?.end(outcome: 'superseded');
+            return;
+          }
+          final items = (data['Items'] as List?) ?? [];
+          _seriesEpisodes = _mapItems(items, fallbackRating: _item?.officialRating);
+          _seriesEpisodesLoaded = true;
+          seriesEpisodesError = null;
+          trace?.end(data: {'items': items.length});
+          notifyListeners();
+          return;
+        } catch (error) {
+          if (_isDisposed || generation != _episodeGeneration) {
+            trace?.end(outcome: 'canceled');
+            return;
+          }
+          final delay = attempt == 0 ? episodeRetryDelay(error) : null;
+          if (delay != null) {
+            final waiter = Completer<bool>();
+            _episodeRetryWaiter = waiter;
+            _episodeRetryTimer = Timer(delay, () => waiter.complete(true));
+            if (await waiter.future) continue;
+            trace?.end(outcome: 'canceled');
+            return;
+          }
+          // A failed request stays attempted until an explicit refresh. A build
+          // never starts a retry, including terminal 400/404 responses.
+          seriesEpisodesError = error;
+          trace?.end(outcome: 'api_error', data: {'retryOnRebuild': false});
+          notifyListeners();
+          return;
+        }
+      }
+    })).whenComplete(() {
+      if (identical(_seriesEpisodesPending, pending)) _seriesEpisodesPending = null;
+    });
+    _seriesEpisodesPending = pending;
+    return pending;
   }
 
-  Future<void> _loadAllSeriesEpisodesRecorded(PerformanceSpan? trace) async {
-    final item = _item;
-    if (item == null) { trace?.end(outcome: 'no_item'); return; }
-    final seriesId = item.type == 'Series' ? itemId : item.seriesId;
-    if (seriesId == null || seriesId.isEmpty) { trace?.end(outcome: 'no_series'); return; }
-    if (_seriesEpisodesRequested) { trace?.end(outcome: 'already_requested'); return; }
-    _seriesEpisodesRequested = true;
-    try {
-      final data = await _client.itemsApi.getEpisodes(
-        seriesId,
-        fields: _episodeOverviewFields,
-      );
-      final items = (data['Items'] as List?) ?? [];
-      _seriesEpisodes = _mapItems(
-        items,
-        fallbackRating: _item?.officialRating,
-      );
-      trace?.end(data: {'items': items.length});
-      _seriesEpisodesLoaded = true;
-      notifyListeners();
-    } catch (_) {
-      trace?.end(outcome: 'api_error', data: {'retryOnRebuild': true});
-      // Left unloaded and silent on purpose. The Modern layout calls this from
-      // build, so the next rebuild gets another go, and notifying here would
-      // turn that into a loop against a server that is down.
-      _seriesEpisodesRequested = false;
-    }
+  void _cancelEpisodeRetry() {
+    _episodeGeneration++;
+    _episodeRetryTimer?.cancel();
+    _episodeRetryTimer = null;
+    final waiter = _episodeRetryWaiter;
+    _episodeRetryWaiter = null;
+    if (waiter != null && !waiter.isCompleted) waiter.complete(false);
+    _seriesEpisodesPending = null;
   }
 
   Future<void> refreshSeriesEpisodes() {
+    _cancelEpisodeRetry();
+    _episodeScope.cancel();
+    _episodeScope = RequestWorkScope();
     _seriesEpisodesRequested = false;
     _seriesEpisodesLoaded = false;
+    seriesEpisodesError = null;
     return loadAllSeriesEpisodes(caller: 'refresh');
   }
 
@@ -1936,25 +2000,9 @@ class ItemDetailViewModel extends ChangeNotifier {
 
     try {
       final Map<String, ({String name, Map<String, dynamic> rawData})> boxSetInfo = {};
-      final ancestors = await _client.itemsApi.getAncestors(item.id);
-      for (final ancestor in ancestors) {
-        if (ancestor['Type'] == 'BoxSet') {
-          final boxSetId = ancestor['Id']?.toString();
-          final name = ancestor['Name']?.toString();
-          if (boxSetId != null && boxSetId.isNotEmpty && name != null) {
-            final isMember = await _boxSetContainsItem(boxSetId, item.id);
-            if (isMember && !boxSetInfo.containsKey(boxSetId)) {
-              boxSetInfo[boxSetId] = (
-                name: name,
-                rawData: Map<String, dynamic>.from(ancestor),
-              );
-            }
-          }
-        }
-      }
-
-      final scannedCollections = await _findParentCollectionsByScanningBoxSets(item.id);
-      boxSetInfo.addAll(scannedCollections);
+      boxSetInfo.addAll(await CollectionMembershipLookup.forClient(_client)
+          .find(_client, item.id, owner: _secondaryScope));
+      if (_isDisposed) return;
 
       if (boxSetInfo.isEmpty) {
         _parentCollections = const [];
@@ -1966,14 +2014,12 @@ class ItemDetailViewModel extends ChangeNotifier {
       // between opens.
       final entries = boxSetInfo.entries.toList();
       final ordered = List<ParentCollection?>.filled(entries.length, null);
-      final fetchFutures = <Future<void>>[];
-
-      for (var i = 0; i < entries.length; i++) {
+      await mapBounded<int, void>(List.generate(entries.length, (i) => i), 2, (i) async {
+        if (_isDisposed) return;
         final index = i;
         final boxSetId = entries[i].key;
         final info = entries[i].value;
 
-        fetchFutures.add(() async {
           // Not recursive and not filtered, same as the collection grid, so a
           // collection made of episodes still shows its members here.
           final data = await _client.itemsApi.getItems(
@@ -1994,10 +2040,9 @@ class ItemDetailViewModel extends ChangeNotifier {
             ),
             items: _sortCollectionByReleaseOrder(_mapItems(items)),
           );
-        }());
-      }
-      await Future.wait(fetchFutures);
+      });
 
+      if (_isDisposed) return;
       final collections = ordered.whereType<ParentCollection>().toList();
 
       _parentCollections = collections;
@@ -2006,101 +2051,6 @@ class ItemDetailViewModel extends ChangeNotifier {
       final load = ++_parentCollectionsLoad;
       unawaited(_loadMissingParentCollectionItems(collections, load));
     } catch (_) {}
-  }
-
-  Future<bool> _boxSetContainsItem(String boxSetId, String itemId) async {
-    try {
-      // Membership is a direct-children question. Walking the tree would report
-      // an episode as belonging to whatever collection holds its series, and
-      // hand back every episode in the collection to answer it.
-      final membership = await _client.itemsApi.getItems(
-        parentId: boxSetId,
-        fields: 'BasicSyncInfo',
-      );
-      final members = (membership['Items'] as List?) ?? const [];
-      return members.whereType<Map>().any((entry) {
-        final map = entry.cast<String, dynamic>();
-        return map['Id'] == itemId;
-      });
-    } catch (_) {
-      return false;
-    }
-  }
-
-  Future<Map<String, ({String name, Map<String, dynamic> rawData})>> _findParentCollectionsByScanningBoxSets(String itemId) async {
-    final Map<String, ({String name, Map<String, dynamic> rawData})> result = {};
-    try {
-      const pageSize = 200;
-      var startIndex = 0;
-
-      while (true) {
-        final data = await _client.itemsApi.getItems(
-          includeItemTypes: ['BoxSet'],
-          recursive: true,
-          sortBy: 'SortName',
-          fields: 'BasicSyncInfo,PrimaryImageAspectRatio,ImageTags,ProviderIds',
-          startIndex: startIndex,
-          limit: pageSize,
-          enableTotalRecordCount: true,
-        );
-        final boxSets = (data['Items'] as List?) ?? const [];
-        PerformanceTrace.event('collections.page', {
-          'items': boxSets.length,
-          'offset': startIndex,
-        });
-        if (boxSets.isEmpty) {
-          break;
-        }
-
-        final candidates = <({String id, String name, Map<String, dynamic> rawData})>[];
-        for (final raw in boxSets.whereType<Map>()) {
-          final boxSet = raw.cast<String, dynamic>();
-          final boxSetId = boxSet['Id']?.toString();
-          final boxSetName = boxSet['Name']?.toString();
-          if (boxSetId == null || boxSetId.isEmpty || boxSetName == null) {
-            continue;
-          }
-          candidates.add((id: boxSetId, name: boxSetName, rawData: boxSet));
-        }
-
-        // Cap how many membership lookups run at once so a large library
-        // doesn't fire a whole page of requests in one burst.
-        const maxConcurrent = 12;
-        for (var i = 0; i < candidates.length; i += maxConcurrent) {
-          final batch = candidates.skip(i).take(maxConcurrent);
-          await Future.wait(
-            batch.map((candidate) async {
-              final membership = await _client.itemsApi.getItems(
-                parentId: candidate.id,
-                fields: 'BasicSyncInfo',
-              );
-              final members = (membership['Items'] as List?) ?? const [];
-              PerformanceTrace.event('collections.membership_checked', {
-                'items': members.length,
-                'disposed': _isDisposed,
-              });
-              final hasItem = members.whereType<Map>().any((entry) {
-                final map = entry.cast<String, dynamic>();
-                return map['Id'] == itemId;
-              });
-              if (hasItem) {
-                result[candidate.id] = (
-                  name: candidate.name,
-                  rawData: candidate.rawData,
-                );
-              }
-            }),
-          );
-        }
-
-        if (boxSets.length < pageSize) {
-          break;
-        }
-        startIndex += boxSets.length;
-      }
-    } catch (_) {}
-
-    return result;
   }
 
   List<AggregatedItem> _sortCollectionByReleaseOrder(
@@ -2515,6 +2465,9 @@ class ItemDetailViewModel extends ChangeNotifier {
     PerformanceTrace.disposed(this, 'details');
     PerformanceTrace.event('details.disposed');
     _isDisposed = true;
+    _secondaryScope.cancel();
+    _episodeScope.cancel();
+    _cancelEpisodeRetry();
     userDataSync.removeListener(_onUserDataChanged);
     // The child owns a download poll timer, so this is what stops it.
     _seerr?.removeListener(notifyListeners);
@@ -2522,4 +2475,24 @@ class ItemDetailViewModel extends ChangeNotifier {
     _seerr = null;
     super.dispose();
   }
+}
+
+/// Only a transient transport/server failure gets one automatic retry. A long
+/// Retry-After remains an explicit user retry; never retry earlier than asked.
+@visibleForTesting
+Duration? episodeRetryDelay(Object error) {
+  if (error is! DioException || error.type == DioExceptionType.cancel) return null;
+  final status = error.response?.statusCode;
+  final transient = status == 429 || (status != null && status >= 500) ||
+      error.type == DioExceptionType.connectionError ||
+      error.type == DioExceptionType.connectionTimeout ||
+      error.type == DioExceptionType.receiveTimeout;
+  if (!transient) return null;
+  final retryAfter = error.response?.headers.value('retry-after');
+  if (retryAfter != null) {
+    final seconds = int.tryParse(retryAfter);
+    if (seconds == null || seconds < 0 || seconds > 30) return null;
+    return Duration(seconds: seconds);
+  }
+  return const Duration(seconds: 1);
 }

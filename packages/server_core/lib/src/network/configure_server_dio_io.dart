@@ -1,7 +1,5 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
@@ -9,6 +7,8 @@ import 'package:dio/io.dart';
 import '../diagnostics/server_log_sink.dart';
 import '../diagnostics/performance_interceptor.dart';
 import 'server_user_agent.dart';
+import 'request_work_scope.dart';
+import 'scheduled_http_adapter.dart';
 
 /// How many requests may be reaching the server at once.
 ///
@@ -28,10 +28,11 @@ const _requestSlots = 6;
 const _idleTimeout = Duration(seconds: 15);
 
 void configureServerDio(Dio dio, {Duration? idleTimeout}) {
+  dio.interceptors.add(RequestScopeInterceptor());
   dio.interceptors.add(PerformanceInterceptor());
   dio.transformer = FusedTransformer(contentLengthIsolateThreshold: 50 * 1024);
 
-  dio.httpClientAdapter = _SlotLimitedAdapter(
+  dio.httpClientAdapter = ScheduledHttpAdapter(
     IOHttpClientAdapter(
       createHttpClient: () {
         final client = HttpClient();
@@ -51,7 +52,7 @@ void configureServerDio(Dio dio, {Duration? idleTimeout}) {
         return client;
       },
     ),
-    _requestSlots,
+    slots: _requestSlots,
   );
 
   dio.interceptors.add(_retryDeadConnection(dio));
@@ -100,65 +101,3 @@ Interceptor _retryDeadConnection(Dio dio) => InterceptorsWrapper(
     }
   },
 );
-
-/// Holds a request back until one of a fixed number of slots is free.
-///
-/// Dio starts its connect timeout only once the request is handed on, so the
-/// wait sits outside it and a busy screen queues without any of it reading as
-/// the host failing to answer. A slot covers the connect and the wait for the
-/// headers. The body drains after that, bounded by the client's per host limit.
-class _SlotLimitedAdapter implements HttpClientAdapter {
-  _SlotLimitedAdapter(this._inner, this._free);
-
-  final HttpClientAdapter _inner;
-  int _free;
-  final _waiting = Queue<Completer<void>>();
-
-  Future<void> _acquire() {
-    if (_free > 0) {
-      _free--;
-      return Future.value();
-    }
-    final waiter = Completer<void>();
-    _waiting.add(waiter);
-    return waiter.future;
-  }
-
-  void _release() {
-    if (_waiting.isNotEmpty) {
-      _waiting.removeFirst().complete();
-    } else {
-      _free++;
-    }
-  }
-
-  @override
-  Future<ResponseBody> fetch(
-    RequestOptions options,
-    Stream<Uint8List>? requestStream,
-    Future<void>? cancelFuture,
-  ) async {
-    final timing = PerformanceInterceptor.span(options);
-    timing?.mark('http.queued', {'queued': _waiting.length, 'free': _free});
-    final queuedAt = timing?.elapsedUs;
-    await _acquire();
-    final dispatchedAt = timing?.elapsedUs;
-    timing?.mark('http.dispatched', {
-      'durationUs': dispatchedAt! - queuedAt!,
-    });
-    try {
-      final body = await _inner.fetch(options, requestStream, cancelFuture);
-      PerformanceInterceptor.headersReceived(options);
-      timing?.mark('http.headers', {
-        'status': body.statusCode,
-        'durationUs': timing.elapsedUs - dispatchedAt!,
-      });
-      return body;
-    } finally {
-      _release();
-    }
-  }
-
-  @override
-  void close({bool force = false}) => _inner.close(force: force);
-}

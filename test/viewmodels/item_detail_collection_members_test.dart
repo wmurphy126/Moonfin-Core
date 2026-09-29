@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
 import 'package:jellyfin_preference/jellyfin_preference.dart';
@@ -89,4 +91,55 @@ void main() {
     expect(vm.collectionItems.map((i) => i.type), everyElement('Episode'));
     expect(vm.collectionItems.first.name, 'Flash vs. Arrow');
   });
+  Future<ItemDetailViewModel> series({String id = '12345'}) async {
+    when(() => itemsApi.getItem(id, mediaSourceId: any(named: 'mediaSourceId')))
+        .thenAnswer((_) async => {'Id': id, 'Name': 'Series', 'Type': 'Series'});
+    final tmdb = TmdbRepository(client);
+    final vm = ItemDetailViewModel(itemId: id, client: client,
+      mutations: ItemMutationRepository(client), mdbListRepository: MdbListRepository(client, tmdb), tmdbRepository: tmdb);
+    addTearDown(vm.dispose);
+    await vm.load();
+    return vm;
+  }
+  test('episode 400 does not retry on repeated builds; explicit retry works', () async {
+    final vm = await series();
+    final request = RequestOptions(path: '/Shows/12345/Episodes');
+    when(() => itemsApi.getEpisodes('12345', fields: any(named: 'fields')))
+      .thenThrow(DioException(requestOptions: request, response: Response(requestOptions: request, statusCode: 400)));
+    for (var i = 0; i < 20; i++) { await vm.loadAllSeriesEpisodes(); }
+    verify(() => itemsApi.getEpisodes('12345', fields: any(named: 'fields'))).called(1);
+    expect(vm.seriesEpisodesError, isA<DioException>());
+    when(() => itemsApi.getEpisodes('12345', fields: any(named: 'fields'))).thenAnswer((_) async => {'Items': []});
+    await vm.refreshSeriesEpisodes();
+    expect(vm.seriesEpisodesLoaded, isTrue); expect(vm.seriesEpisodesError, isNull);
+  });
+  test('concurrent local series consumers share one episode request', () async {
+    final vm = await series();
+    final reply = Completer<Map<String, dynamic>>();
+    when(() => itemsApi.getEpisodes('12345', fields: any(named: 'fields'))).thenAnswer((_) => reply.future);
+    final a = vm.loadAllSeriesEpisodes(), b = vm.loadAllSeriesEpisodes();
+    expect(identical(a, b), isTrue);
+    reply.complete({'Items': []}); await Future.wait([a, b]);
+    verify(() => itemsApi.getEpisodes('12345', fields: any(named: 'fields'))).called(1);
+  });
+  test('synthetic series never enters Jellyfin episode endpoint', () async {
+    final tmdb = TmdbRepository(client);
+    final vm = ItemDetailViewModel(itemId: 'tmdb:tv:42', client: client,
+      mutations: ItemMutationRepository(client), mdbListRepository: MdbListRepository(client, tmdb), tmdbRepository: tmdb);
+    addTearDown(vm.dispose);
+    for (var i = 0; i < 20; i++) { await vm.loadAllSeriesEpisodes(); }
+    verifyNever(() => itemsApi.getEpisodes(any(), fields: any(named: 'fields')));
+  });
+  test('only transient episode errors get a bounded retry respecting Retry-After', () {
+    DioException error(int status, [String? retry]) {
+      final request = RequestOptions(path: '/episodes');
+      return DioException(requestOptions: request, response: Response(requestOptions: request,
+        statusCode: status, headers: Headers.fromMap({if (retry != null) 'retry-after': [retry]})));
+    }
+    expect(episodeRetryDelay(error(400)), isNull); expect(episodeRetryDelay(error(404)), isNull);
+    expect(episodeRetryDelay(error(429, '4')), const Duration(seconds: 4));
+    expect(episodeRetryDelay(error(503)), const Duration(seconds: 1));
+    expect(episodeRetryDelay(error(429, '120')), isNull);
+  });
+
 }

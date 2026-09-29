@@ -118,7 +118,7 @@ Future<bool> launchPlayerWhilePreparing(
 
     final started = await PerformanceTrace.measure(
       'play.preparation',
-      () => startPlayback(session),
+      () => RequestWorkScope.withPriority(RequestPriority.foreground, () => startPlayback(session)),
     );
     // A preparation that quietly gives up on the way to playItems still
     // reports success, and taking it at its word parks the player route on a

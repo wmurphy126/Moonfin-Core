@@ -99,6 +99,14 @@ class SearchViewModel extends ChangeNotifier {
   Object? get error => _error;
 
   Timer? _debounceTimer;
+  int _generation = 0;
+  RequestWorkScope? _work;
+  bool _disposed = false;
+  final Set<String> _pendingCategories = {};
+  final Map<String, Object> _categoryErrors = {};
+  Set<String> get pendingCategories => Set.unmodifiable(_pendingCategories);
+  Map<String, Object> get categoryErrors => Map.unmodifiable(_categoryErrors);
+  PerformanceSpan? _inputSpan;
 
   static const _debounceMs = 600;
   static const _resultLimit = 24;
@@ -156,6 +164,13 @@ class SearchViewModel extends ChangeNotifier {
     final trimmed = query.trim();
     if (trimmed == _query) return;
     _query = trimmed;
+    final generation = ++_generation;
+    _work?.cancel();
+    _work = RequestWorkScope();
+    _inputSpan?.end(outcome: 'superseded');
+    _inputSpan = trimmed.isEmpty
+        ? null
+        : PerformanceTrace.begin('search.input_to_first_result');
 
     _debounceTimer?.cancel();
 
@@ -163,6 +178,8 @@ class SearchViewModel extends ChangeNotifier {
       _results = const [];
       _seerrResults = const [];
       _gameResults = const [];
+      _pendingCategories.clear();
+      _categoryErrors.clear();
       _state = SearchState.idle;
       notifyListeners();
       return;
@@ -173,7 +190,7 @@ class SearchViewModel extends ChangeNotifier {
 
     _debounceTimer = Timer(
       const Duration(milliseconds: _debounceMs),
-      () => _executeSearch(trimmed),
+      () => _executeSearch(trimmed, generation),
     );
   }
 
@@ -181,119 +198,171 @@ class SearchViewModel extends ChangeNotifier {
     final trimmed = query.trim();
     if (trimmed.isEmpty) return;
     _query = trimmed;
+    final generation = ++_generation;
+    _work?.cancel();
+    _work = RequestWorkScope();
+    _inputSpan?.end(outcome: 'superseded');
+    _inputSpan = trimmed.isEmpty
+        ? null
+        : PerformanceTrace.begin('search.input_to_first_result');
     _debounceTimer?.cancel();
     _state = SearchState.loading;
     notifyListeners();
-    _executeSearch(trimmed);
+    unawaited(_executeSearch(trimmed, generation));
   }
 
-  Future<void> _executeSearch(String query) => PerformanceTrace.measure(
-    'search.execute',
-    () => _executeSearchRecorded(query),
-  );
-
-  Future<void> _executeSearchRecorded(String query) async {
-    PerformanceTrace.observed(this, 'search');
-    if (query != _query) return;
-
-    try {
-      final activeGroups = _scopedParentId != null
-          ? _bookSearchGroups()
-          : _searchGroups();
-      final seerrFuture = PerformanceTrace.measure(
-        'search.seerr',
-        () => _fetchSeerrResults(query),
+  Future<void> _executeSearch(String query, int generation) =>
+      PerformanceTrace.measure(
+        'search.execute',
+        () => _work!.run(() => _executeSearchRecorded(query, generation)),
       );
-      final gamesFuture = _scopedParentId != null
-          ? Future.value(const <GameSearchResult>[])
-          : PerformanceTrace.measure(
-              'search.games',
-              () => _fetchGameResults(query),
-            );
 
-      final groups = _scopedParentId != null
-          ? await Future.wait(
-              activeGroups.map((group) async {
-                final items = await _searchRepository.search(
-                  query,
-                  includeItemTypes: group.itemTypes,
-                  parentId: _scopedParentId,
-                  limit: _resultLimit,
-                );
-                return group.copyWith(items: items);
-              }),
-            )
-          : await _buildGroupedGlobalResults(query, activeGroups);
-      PerformanceTrace.event('search.library.ready', {'groups': groups.length});
-      final seerr = await seerrFuture;
-      final games = await gamesFuture;
-
-      if (query != _query) return;
-
-      _results = groups.where((g) => g.items.isNotEmpty).toList();
-      _seerrResults = seerr;
-      _gameResults = games;
-      _state = SearchState.ready;
-      PerformanceTrace.event('search.data.ready', {
-        'groups': _results.length,
-        'seerr': seerr.length,
-        'games': games.length,
+  Future<void> _executeSearchRecorded(String query, int generation) async {
+    bool current() => !_disposed && generation == _generation;
+    if (!current()) return;
+    PerformanceTrace.observed(this, 'search');
+    _error = null;
+    _categoryErrors.clear();
+    final groups = _scopedParentId != null
+        ? _bookSearchGroups()
+        : _searchGroups();
+    final populated = <String, List<AggregatedItem>>{};
+    var seerr = const <SeerrDiscoverItem>[];
+    var games = const <GameSearchResult>[];
+    var published = false;
+    _pendingCategories
+      ..clear()
+      ..addAll([
+        'library',
+        'seerr',
+        'games',
+        if (_scopedParentId == null) ...['people', 'channels'],
+      ]);
+    void publish(String category) {
+      if (!current()) return;
+      final results = [
+        for (final group in groups)
+          if (populated[group.title]?.isNotEmpty ?? false)
+            group.copyWith(items: populated[group.title]),
+      ];
+      final hasData =
+          results.isNotEmpty || seerr.isNotEmpty || games.isNotEmpty;
+      if (hasData || published || _pendingCategories.isEmpty) {
+        _results = results;
+        _seerrResults = seerr;
+        _gameResults = games;
+        published = true;
+      }
+      if (hasData) {
+        _inputSpan?.end(data: {'generation': generation});
+        _inputSpan = null;
+      }
+      if (_pendingCategories.isEmpty) {
+        _error = _categoryErrors['library'];
+        _state = !hasData && _error != null
+            ? SearchState.error
+            : SearchState.ready;
+        _inputSpan?.end(outcome: 'no_results');
+        _inputSpan = null;
+      }
+      PerformanceTrace.event('search.category.data.ready', {
+        'kind': category,
+        'generation': generation,
+        'groups': results.length,
+        'pending': _pendingCategories.length,
       });
-    } catch (e) {
-      if (query != _query) return;
-      _error = e;
-      _state = SearchState.error;
+      notifyListeners();
     }
-    notifyListeners();
-  }
 
-  Future<List<SearchResultGroup>> _buildGroupedGlobalResults(
-    String query,
-    List<SearchResultGroup> activeGroups,
-  ) async {
-    // Looked up once before the searches start, so each of them reuses it
-    // instead of looking the servers up again.
-    final sessions = await _multiServerRepository?.getLoggedInServers();
-    _serverNames = sessions != null && sessions.length > 1
-        ? {
-            for (final session in sessions)
-              session.server.id: session.server.name,
-          }
-        : const {};
-    final peopleFuture = _searchEachServer(
-      (repository) => repository.searchPeople(query, limit: _resultLimit),
-      label: 'people search',
-    ).then(_interleave).catchError((_) => <AggregatedItem>[]);
-    final channelsFuture = _channelMatches(query);
-    final perServerItems = await _searchEachServer(
-      (repository) => repository.search(
-        query,
-        parentId: _scopedParentId,
-        limit: _globalFetchLimit,
+    Future<void> category(String name, Future<void> Function() fetch) async {
+      try {
+        await PerformanceTrace.measure('search.$name', fetch);
+      } catch (error) {
+        if (current()) _categoryErrors[name] = error;
+      } finally {
+        if (current()) {
+          _pendingCategories.remove(name);
+          publish(name);
+        }
+      }
+    }
+
+    final requests = <Future<void>>[
+      category('seerr', () async => seerr = await _fetchSeerrResults(query)),
+      category(
+        'games',
+        () async => games = _scopedParentId != null
+            ? []
+            : await _fetchGameResults(query),
       ),
-      label: 'search',
-    );
-    final people = await peopleFuture;
-    final channels = await channelsFuture;
-
-    final grouped = <SearchResultGroup>[];
-    for (final group in activeGroups) {
-      if (group.itemTypes.contains('Person')) {
-        grouped.add(group.copyWith(items: people.take(_resultLimit).toList()));
-        continue;
-      }
-      if (group.itemTypes.contains('LiveTvChannel')) {
-        grouped.add(group.copyWith(items: channels));
-        continue;
-      }
-      final matched = _interleave([
-        for (final items in perServerItems)
-          items.where((item) => group.itemTypes.contains(item.type)).toList(),
-      ]).take(_resultLimit).toList();
-      grouped.add(group.copyWith(items: matched));
-    }
-
-    return grouped;
+      category('library', () async {
+        if (_scopedParentId != null) {
+          await Future.wait(
+            groups.map((group) async {
+              populated[group.title] = await _searchRepository.search(
+                query,
+                includeItemTypes: group.itemTypes,
+                parentId: _scopedParentId,
+                limit: _resultLimit,
+              );
+              publish('library_group');
+            }),
+          );
+        } else {
+          final sessions = await _multiServerRepository?.getLoggedInServers();
+          if (!current()) return;
+          _serverNames = sessions != null && sessions.length > 1
+              ? {
+                  for (final session in sessions)
+                    session.server.id: session.server.name,
+                }
+              : const {};
+          final perServer = await _searchEachServer(
+            (repo) => repo.search(
+              query,
+              parentId: _scopedParentId,
+              limit: _globalFetchLimit,
+            ),
+            label: 'search',
+          );
+          for (final group in groups) {
+            if (group.itemTypes.contains('Person') ||
+                group.itemTypes.contains('LiveTvChannel'))
+              continue;
+            populated[group.title] = _interleave([
+              for (final items in perServer)
+                items
+                    .where((item) => group.itemTypes.contains(item.type))
+                    .toList(),
+            ]).take(_resultLimit).toList();
+          }
+          PerformanceTrace.event('search.library.ready', {
+            'generation': generation,
+          });
+        }
+      }),
+      if (_scopedParentId == null) ...[
+        category('people', () async {
+          final results = await _searchEachServer(
+            (repo) => repo.searchPeople(query, limit: _resultLimit),
+            label: 'people search',
+          );
+          populated[groups
+              .firstWhere((g) => g.itemTypes.contains('Person'))
+              .title] = _interleave(results)
+              .take(_resultLimit)
+              .toList();
+        }),
+        category('channels', () async {
+          populated[groups
+              .firstWhere((g) => g.itemTypes.contains('LiveTvChannel'))
+              .title] = await _channelMatches(
+            query,
+          );
+        }),
+      ],
+    ];
+    await Future.wait(requests);
   }
 
   Future<List<List<AggregatedItem>>> _searchEachServer(
@@ -327,10 +396,10 @@ class SearchViewModel extends ChangeNotifier {
     // answers, so the folding it would have done has to happen here.
     final q = foldForSearch(query.trim());
     if (q.isEmpty || q.startsWith('studio:')) return const [];
-    _channelsFuture ??= _searchEachServer(
+    _channelsFuture ??= RequestWorkScope.detached(() => _searchEachServer(
       (repository) => repository.fetchLiveTvChannels(),
       label: 'channel lineup',
-    ).then((perServer) => perServer.expand((channels) => channels).toList());
+    ).then((perServer) => perServer.expand((channels) => channels).toList()));
     try {
       final all = await _channelsFuture!;
       return all
@@ -341,7 +410,7 @@ class SearchViewModel extends ChangeNotifier {
       // A server without Live TV shouldn't break search. Retry next query in
       // case the failure was transient.
       _channelsFuture = null;
-      return const [];
+      rethrow;
     }
   }
 
@@ -356,7 +425,7 @@ class SearchViewModel extends ChangeNotifier {
       final page = await repo.search(query, limit: _resultLimit);
       return page.results.where((item) => !item.isBlacklisted).toList();
     } catch (_) {
-      return const [];
+      rethrow;
     }
   }
 
@@ -368,7 +437,7 @@ class SearchViewModel extends ChangeNotifier {
     final gamesApi = _client.gamesApi;
     if (gamesApi == null) return const [];
     try {
-      _allGamesFuture ??= _fetchAllGames(gamesApi);
+      _allGamesFuture ??= RequestWorkScope.detached(() => _fetchAllGames(gamesApi));
       final all = await _allGamesFuture!;
       return all
           .where(
@@ -380,7 +449,7 @@ class SearchViewModel extends ChangeNotifier {
           .toList();
     } catch (_) {
       _allGamesFuture = null;
-      return const [];
+      rethrow;
     }
   }
 
@@ -399,6 +468,10 @@ class SearchViewModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _work?.cancel();
+    _generation++;
+    _inputSpan?.end(outcome: 'disposed');
     PerformanceTrace.disposed(this, 'search');
     _debounceTimer?.cancel();
     super.dispose();

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jellyfin_preference/jellyfin_preference.dart';
 import 'package:moonfin/data/repositories/mdblist_repository.dart';
@@ -9,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// A library with no collection type, the way the server reports a mixed one.
 class _FakeItemsApi implements ItemsApi {
+  Future<Map<String, dynamic>>? pendingPage;
   final List<String?> requestedSorts = <String?>[];
   final List<bool?> requestedRecursive = <bool?>[];
 
@@ -61,6 +63,7 @@ class _FakeItemsApi implements ItemsApi {
   }) async {
     requestedSorts.add(sortBy);
     requestedRecursive.add(recursive);
+    if (pendingPage != null) return pendingPage!;
     return <String, dynamic>{
       'TotalRecordCount': 2,
       'Items': [
@@ -82,7 +85,10 @@ class _FakeItemsApi implements ItemsApi {
 }
 
 class _FakeClient implements MediaServerClient {
-  _FakeClient(this.itemsApi);
+  _FakeClient(this.itemsApi, [this.displayApi]);
+  final DisplayPreferencesApi? displayApi;
+  @override
+  DisplayPreferencesApi get displayPreferencesApi => displayApi ?? (throw StateError("no preferences"));
 
   @override
   final ItemsApi itemsApi;
@@ -105,6 +111,7 @@ class _FakeMdbListRepository implements MdbListRepository {
 Future<LibraryBrowseViewModel> _viewModel(
   _FakeItemsApi api, {
   LibrarySortBy? savedSort,
+  DisplayPreferencesApi? displayApi,
 }) async {
   SharedPreferences.setMockInitialValues(<String, Object>{});
   final store = PreferenceStore();
@@ -115,10 +122,21 @@ Future<LibraryBrowseViewModel> _viewModel(
   }
   return LibraryBrowseViewModel(
     libraryId: 'mixed',
-    client: _FakeClient(api),
+    client: _FakeClient(api, displayApi),
     prefs: prefs,
     mdbListRepository: _FakeMdbListRepository(),
   );
+}
+
+class _DisplayPreferences implements DisplayPreferencesApi {
+  final pending = Completer<DisplayPreferences>();
+  int calls = 0;
+  @override
+  Future<DisplayPreferences> getDisplayPreferences(String id, {String? client}) {
+    calls++; return pending.future;
+  }
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 void main() {
@@ -154,4 +172,26 @@ void main() {
     expect(vm.sortBy, LibrarySortBy.premiereDate);
     expect(api.requestedSorts.first, 'PremiereDate,SortName');
   });
+  test('slow cosmetic preferences do not hold data and are shared on refresh', () async {
+    final api = _FakeItemsApi(), display = _DisplayPreferences();
+    final vm = await _viewModel(api, displayApi: display);
+    addTearDown(vm.dispose);
+    await vm.load();
+    expect(vm.state, LibraryBrowseState.ready); expect(vm.items, hasLength(2));
+    await vm.load(); expect(display.calls, 1);
+    display.pending.complete(const DisplayPreferences(id: 'mixed', customPrefs: {'imageType': 'thumb'}));
+    await pumpEventQueue();
+    expect(vm.imageType.name, 'thumb');
+  });
+  test('same query keeps rows while refresh is pending; new sort clears them', () async {
+    final api = _FakeItemsApi(); final vm = await _viewModel(api);
+    addTearDown(vm.dispose); await vm.load();
+    final reply = Completer<Map<String, dynamic>>(); api.pendingPage = reply.future;
+    final refreshing = vm.load(); await pumpEventQueue();
+    expect(vm.state, LibraryBrowseState.ready); expect(vm.isRefreshing, isTrue);
+    expect(vm.items, hasLength(2)); expect(vm.hasMore, isFalse);
+    reply.complete({'Items': [{'Id': 'new', 'Name': 'New', 'Type': 'Movie'}], 'TotalRecordCount': 1});
+    await refreshing; expect(vm.items.single.id, 'new'); expect(vm.isRefreshing, isFalse);
+  });
+
 }

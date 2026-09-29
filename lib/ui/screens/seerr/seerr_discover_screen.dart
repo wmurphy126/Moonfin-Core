@@ -16,6 +16,7 @@ import '../../../ui/mixins/focus_state_mixin.dart';
 import '../../../util/focus/dpad_keys.dart';
 import '../../../util/platform_detection.dart';
 import '../../navigation/destinations.dart';
+import '../../navigation/route_lifecycle_observer.dart';
 import '../../widgets/adaptive/adaptive_glass.dart';
 import '../../widgets/media_card.dart';
 import '../../widgets/bottom_nav/bottom_navbar.dart';
@@ -46,7 +47,7 @@ class SeerrDiscoverScreen extends StatefulWidget {
       _SeerrDiscoverScreenState();
 }
 
-class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
+class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> with RouteAware {
   SeerrDiscoverViewModel? _viewModel;
   final _prefs = GetIt.instance<UserPreferences>();
   final _scrollController = ScrollController();
@@ -63,15 +64,43 @@ class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
   bool _initialFocusResolved = false;
   bool _isFirstRowFocused = false;
   int _firstFocusableVisibleIndex = -1;
-  final Map<int, GlobalKey<LockedFocusRowState>> _rowKeys = {};
-  final Map<int, ScrollController> _rowScrollControllers = {};
+  final Map<Object, GlobalKey<LockedFocusRowState>> _rowKeys = {};
+  final Map<Object, ScrollController> _rowScrollControllers = {};
 
   GlobalKey<LockedFocusRowState> _getRowKey(int index) {
-    return _rowKeys.putIfAbsent(index, () => GlobalKey<LockedFocusRowState>());
+    return _rowKeys.putIfAbsent(_rowIdentity(index), () => GlobalKey<LockedFocusRowState>());
   }
 
   ScrollController _getRowScroll(int index) {
-    return _rowScrollControllers.putIfAbsent(index, () => ScrollController());
+    return _rowScrollControllers.putIfAbsent(_rowIdentity(index), () => ScrollController());
+  }
+
+  Object _rowIdentity(int index) => _viewModel != null && index < _viewModel!.rows.length
+      ? _viewModel!.rows[index].type : index;
+
+  PageRoute<dynamic>? _observedRoute;
+  bool _covered = false;
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is PageRoute && route != _observedRoute) {
+      pageRouteLifecycleObserver.unsubscribe(this);
+      _observedRoute = route;
+      pageRouteLifecycleObserver.subscribe(this, route);
+    }
+  }
+
+  @override
+  void didPushNext() {
+    _covered = true;
+    _viewModel?.detach(this);
+  }
+
+  @override
+  void didPopNext() {
+    _covered = false;
+    _viewModel?.attach(this);
   }
 
   // Touch UIs should not force focus onto items, so the initial-focus
@@ -90,6 +119,9 @@ class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
 
   bool _onRowVerticalNavigation(int rowIndex, bool isUp) {
     final targetIndex = isUp ? rowIndex - 1 : rowIndex + 1;
+    if (targetIndex >= 0 && targetIndex < (_viewModel?.rows.length ?? 0)) {
+      _viewModel?.prioritize(_viewModel!.rows[targetIndex].type);
+    }
     if (targetIndex >= 0 && targetIndex < _viewModel!.rows.length) {
       final targetKey = _getRowKey(targetIndex);
       final state = targetKey.currentState;
@@ -135,6 +167,8 @@ class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
   Future<void> _initViewModel() async {
     final vm = await GetIt.instance.getAsync<SeerrDiscoverViewModel>();
     if (!mounted) return;
+    vm.attach(this);
+    if (_covered) vm.detach(this);
     vm.addListener(_onChanged);
     setState(() => _viewModel = vm);
     vm.load();
@@ -173,12 +207,14 @@ class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
 
   @override
   void dispose() {
+    pageRouteLifecycleObserver.unsubscribe(this);
     _selectionDebounce?.cancel();
     _backdropDebounce?.cancel();
     _scrollController.dispose();
     for (final controller in _rowScrollControllers.values) {
       controller.dispose();
     }
+    _viewModel?.detach(this);
     _viewModel?.removeListener(_onChanged);
     _prefs.removeListener(_onPrefsChanged);
     _initialFocusNode.removeListener(_onInitialFocusNodeChanged);
@@ -647,7 +683,7 @@ class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
       child: LockedFocusRow<SeerrDiscoverItem>(
         key: focusKey,
         items: row.items,
-        hubKey: 'seerr_discover_media_${rowIndex}_${row.type.name}',
+        hubKey: 'seerr_discover_media_${row.type.name}',
         controller: _getRowScroll(rowIndex),
         itemExtent: 130,
         itemSpacing: itemSpacing,
@@ -661,7 +697,11 @@ class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
         ),
         onLeftEdge: _onRowLeftEdge,
         onVerticalNavigation: (isUp) => _onRowVerticalNavigation(rowIndex, isUp),
-        onTap: (index, item) => _onItemTap(item),
+        onTap: (index, item) {
+          if (item.title?.isNotEmpty != true && item.name?.isNotEmpty != true &&
+              _viewModel!.isEnriching(row.type, item)) return;
+          _onItemTap(item);
+        },
         onIndexChanged: (index, item) {
           _onItemSelected(item);
           if (rowIndex == 0) {
@@ -677,6 +717,12 @@ class _SeerrDiscoverScreenState extends State<SeerrDiscoverScreen> {
         autofocus: autofocusFirst,
         focusNode: autofocusFirst ? firstFocusNode : null,
         itemBuilder: (context, item, index, isFocused) {
+          if (item.title?.isNotEmpty != true && item.name?.isNotEmpty != true &&
+              _viewModel!.isEnriching(row.type, item)) {
+            return SizedBox(width: 130 * desktopScale, child: SkeletonShimmer(
+              child: SkeletonBox(width: 130 * desktopScale, height: 195 * desktopScale),
+            ));
+          }
           return MediaCard(
             title: item.displayTitle,
             subtitle: _yearFromItem(item),

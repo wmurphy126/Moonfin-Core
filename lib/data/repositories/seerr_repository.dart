@@ -1,3 +1,4 @@
+import '../utils/expiring_cache.dart';
 import 'package:jellyfin_preference/jellyfin_preference.dart';
 import 'package:server_core/server_core.dart';
 
@@ -40,7 +41,26 @@ class SeerrRepository {
   int _cachedBadgeCount = 0;
   static const _badgeCountCacheDurationMs = 60 * 1000;
 
-  final Map<String, SeerrMediaSummary> _mediaSummaryCache = {};
+  final _mediaSummaryCache = ExpiringCache<String, SeerrMediaSummary>(
+      capacity: 128, ttl: const Duration(minutes: 1));
+  final Map<(SeerrHttpClient, String), Future<Map<String, dynamic>>> _reads = {};
+  int _cacheGeneration = 0;
+
+  Future<Map<String, dynamic>> _sharedRead(SeerrHttpClient client, String key,
+      Future<Map<String, dynamic>> Function() read) {
+    final scope = (client, key);
+    final existing = _reads[scope];
+    PerformanceTrace.event('cache.seerr.inflight', {'hit': existing != null, 'entries': _reads.length});
+    if (existing != null) return existing;
+    // Bound retained keys. Overflow reads remain functional.
+    if (_reads.length >= 128) return RequestWorkScope.detached(read);
+    late final Future<Map<String, dynamic>> pending;
+    pending = RequestWorkScope.detached(() => Future.sync(read)).whenComplete(() {
+      if (identical(_reads[scope], pending)) _reads.remove(scope);
+    });
+    _reads[scope] = pending;
+    return pending;
+  }
 
   bool get isAvailable => _isAvailable;
   bool get isMoonfinMode => _isMoonfinMode;
@@ -65,12 +85,15 @@ class SeerrRepository {
   String get _lastConnectionSuccessKey => _userKey('last_connection_success');
 
   void _invalidateSessionCache() {
+    _cacheGeneration++;
+    _mediaSummaryCache.clear();
+    _reads.clear();
     _lastSessionCheckMs = 0;
     _lastSessionValid = false;
   }
 
   Future<void> ensureInitialized({bool force = false}) {
-    final next = _initChain.then((_) => _ensureInitialized(force: force));
+    final next = _initChain.then((_) => RequestWorkScope.detached(() => _ensureInitialized(force: force)));
     _initChain = next.catchError((_) {});
     return next;
   }
@@ -86,7 +109,7 @@ class SeerrRepository {
       _invalidateSessionCache();
     }
 
-    if (_initialized && currentUserId != null && currentUserId != _lastUserId) {
+    if (_initialized && currentUserId != _lastUserId) {
       _initialized = false;
       _httpClient?.close();
       _httpClient = null;
@@ -157,7 +180,10 @@ class SeerrRepository {
   }
 
   void _initClient(MoonfinProxyConfig proxyConfig) {
+    _cacheGeneration++;
     _httpClient?.close();
+    _mediaSummaryCache.clear();
+    _reads.clear();
     _httpClient = SeerrHttpClient(proxyConfig: proxyConfig);
     _cachedPublicSettings = null;
   }
@@ -195,7 +221,7 @@ class SeerrRepository {
   }
 
   Future<SeerrUser> getCurrentUser() =>
-      PerformanceTrace.measure('seerr.permissions', () => _withClient((c) async => SeerrUser.fromJson(await c.getCurrentUser())));
+      PerformanceTrace.measure('seerr.permissions', () => _withClient((c) async => SeerrUser.fromJson(await _sharedRead(c, 'current_user', c.getCurrentUser))));
 
   Future<MoonfinStatusResponse> configureWithMoonfin({
     required String jellyfinBaseUrl,
@@ -518,11 +544,11 @@ class SeerrRepository {
   );
 
   Future<SeerrMovieDetails> getMovieDetails(int tmdbId) => _withClient(
-    (c) async => SeerrMovieDetails.fromJson(await c.getMovieDetails(tmdbId)),
+    (c) async => SeerrMovieDetails.fromJson(await _sharedRead(c, 'movie:$tmdbId', () => c.getMovieDetails(tmdbId))),
   );
 
   Future<SeerrTvDetails> getTvDetails(int tmdbId) => _withClient(
-    (c) async => SeerrTvDetails.fromJson(await c.getTvDetails(tmdbId)),
+    (c) async => SeerrTvDetails.fromJson(await _sharedRead(c, 'tv:$tmdbId', () => c.getTvDetails(tmdbId))),
   );
 
   Future<SeerrTvDetails> getTvDetailsByTvdb(int tvdbId) => _withClient(
@@ -531,7 +557,7 @@ class SeerrRepository {
 
   Future<(SeerrMovieDetails, bool)> getMovieDetailsWithWatchlist(int tmdbId) =>
       _withClient((c) async {
-        final json = await c.getMovieDetails(tmdbId);
+        final json = await _sharedRead(c, 'movie:$tmdbId', () => c.getMovieDetails(tmdbId));
         return (
           SeerrMovieDetails.fromJson(json),
           json['onUserWatchlist'] as bool? ?? false,
@@ -540,7 +566,7 @@ class SeerrRepository {
 
   Future<(SeerrTvDetails, bool)> getTvDetailsWithWatchlist(int tmdbId) =>
       _withClient((c) async {
-        final json = await c.getTvDetails(tmdbId);
+        final json = await _sharedRead(c, 'tv:$tmdbId', () => c.getTvDetails(tmdbId));
         return (
           SeerrTvDetails.fromJson(json),
           json['onUserWatchlist'] as bool? ?? false,
@@ -706,15 +732,18 @@ class SeerrRepository {
   }
 
   /// Title and poster for a card, since the request and issue lists only
-  /// carry media ids. Cached for the session.
+  /// carry media ids. Bounded and cached briefly within this account.
   Future<SeerrMediaSummary?> getMediaSummary(
     int tmdbId,
     String mediaType,
   ) async {
+    await ensureInitialized();
+    final generation = _cacheGeneration;
     final key = '$mediaType:$tmdbId';
     final cached = _mediaSummaryCache[key];
     PerformanceTrace.event('cache.seerr', {
       'entries': _mediaSummaryCache.length,
+      'limit': 128, 'hits': _mediaSummaryCache.hits, 'evictions': _mediaSummaryCache.evictions,
       'hit': cached != null,
     });
     if (cached != null) return cached;
@@ -734,9 +763,11 @@ class SeerrRepository {
           posterPath: details.posterPath,
         );
       }
+      if (generation != _cacheGeneration) return null;
       _mediaSummaryCache[key] = summary;
       PerformanceTrace.event('cache.seerr', {
         'entries': _mediaSummaryCache.length,
+      'limit': 128, 'hits': _mediaSummaryCache.hits, 'evictions': _mediaSummaryCache.evictions,
         'hit': false,
       });
       return summary;

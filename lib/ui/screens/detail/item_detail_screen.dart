@@ -112,6 +112,7 @@ import '../../../util/audio_labels.dart';
 import '../../../util/detail_trailer.dart';
 import '../../../util/download_utils.dart';
 import '../../../util/episode_playability.dart';
+import '../../../util/prepare_episode_queue.dart';
 import '../../../util/item_watch_state.dart';
 import '../../../util/season_queue_context.dart';
 import '../../../util/focus/dpad_keys.dart';
@@ -9077,27 +9078,6 @@ class DetailActionButtonsState extends State<DetailActionButtons> {
     return const <AggregatedItem>[];
   }
 
-  Future<List<AggregatedItem>> _truncateQueueIfImmediateNextUnplayable(
-    List<AggregatedItem> queue, {
-    required int startIndex,
-  }) async {
-    if (startIndex < 0 || startIndex >= queue.length - 1) {
-      return queue;
-    }
-
-    // Queues arrive without MediaSources and a missing key reads as playable,
-    // so hydrate the next item first or a broken episode passes the check and
-    // fails once the current one ends.
-    final nextIndex = startIndex + 1;
-    final immediateNext = await _ensureHydrated(queue[nextIndex]);
-    queue[nextIndex] = immediateNext;
-    if (isEligibleNextEpisodeCandidate(immediateNext)) {
-      return queue;
-    }
-
-    return queue.sublist(0, nextIndex);
-  }
-
   Future<bool> _pushPlayerRouteWhileStartingPlayback(
     BuildContext context, {
     required String destination,
@@ -9360,14 +9340,10 @@ class DetailActionButtonsState extends State<DetailActionButtons> {
               (e) => e.id == targetEpisode.id,
             );
             final idx = startIndex >= 0 ? startIndex : 0;
-            var selectedEpisode = queueEpisodes[idx];
-            selectedEpisode = await _ensureHydrated(selectedEpisode);
-            queueEpisodes[idx] = selectedEpisode;
-
-            final seriesQueue = await _truncateQueueIfImmediateNextUnplayable(
-              queueEpisodes,
-              startIndex: idx,
-            );
+            final seriesQueue = await prepareEpisodeQueue(queueEpisodes,
+              startIndex: idx, hydrate: _ensureHydrated,
+              ensureStillWanted: () => ensureLaunchStillWanted(launchSession));
+            final selectedEpisode = seriesQueue[idx];
             final startPosition = resume
                 ? (selectedEpisode.playbackPosition ?? Duration.zero)
                 : Duration.zero;
@@ -9430,15 +9406,10 @@ class DetailActionButtonsState extends State<DetailActionButtons> {
                   )
                 : episodes.indexWhere((e) => !e.isPlayed);
             final idx = startIndex >= 0 ? startIndex : 0;
-            var selectedEpisode = episodes[idx];
-            selectedEpisode = await _ensureHydrated(selectedEpisode);
-            episodes[idx] = selectedEpisode;
-            ensureLaunchStillWanted(launchSession);
-
-            final seasonQueue = await _truncateQueueIfImmediateNextUnplayable(
-              episodes,
-              startIndex: idx,
-            );
+            final seasonQueue = await prepareEpisodeQueue(episodes,
+              startIndex: idx, hydrate: _ensureHydrated,
+              ensureStillWanted: () => ensureLaunchStillWanted(launchSession));
+            final selectedEpisode = seasonQueue[idx];
             final startPosition = resume
                 ? (selectedEpisode.playbackPosition ?? Duration.zero)
                 : Duration.zero;
@@ -9522,17 +9493,10 @@ class DetailActionButtonsState extends State<DetailActionButtons> {
                 (e) => e.id == item.id,
               );
               final idx = startIndex >= 0 ? startIndex : 0;
-              var selectedEpisode = playableEpisodes[idx];
-              selectedEpisode = await _ensureHydrated(selectedEpisode);
-              playableEpisodes[idx] = selectedEpisode;
-              ensureLaunchStillWanted(launchSession);
-
-              final episodeQueue =
-                  await _truncateQueueIfImmediateNextUnplayable(
-                    playableEpisodes,
-                    startIndex: idx,
-                  );
-              ensureLaunchStillWanted(launchSession);
+              final episodeQueue = await prepareEpisodeQueue(playableEpisodes,
+                startIndex: idx, hydrate: _ensureHydrated,
+                ensureStillWanted: () => ensureLaunchStillWanted(launchSession));
+              final selectedEpisode = episodeQueue[idx];
 
               // Fallback to the master item's position context if it's the target episode
               final startPosition = resume

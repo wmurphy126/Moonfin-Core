@@ -58,3 +58,5 @@ export 'src/network/auth_header.dart';
 export 'src/network/redirect_interceptor.dart';
 export 'src/network/server_probe.dart';
 export 'src/network/query_filters_reader.dart';
+
+export 'src/network/request_work_scope.dart';

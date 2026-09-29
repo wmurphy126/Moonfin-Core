@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -99,7 +100,12 @@ class PluginSyncService extends ChangeNotifier {
   onSeerrNotification;
   CancelToken? _settingsStreamCancelToken;
   StreamSubscription<String>? _settingsStreamSubscription;
-  bool _settingsStreamReconnectPending = false;
+  Timer? _settingsStreamReconnectTimer;
+  int _settingsStreamGeneration = 0;
+  PerformanceSpan? _settingsStreamSpan;
+  Stopwatch? _settingsStreamClock;
+  int? _settingsStreamLastEventUs;
+  final _settingsStreamJitter = Random();
   int _settingsStreamReconnectAttempt = 0;
 
   bool _isSyncingFromServer = false;
@@ -423,55 +429,50 @@ class PluginSyncService extends ChangeNotifier {
     }
   }
 
-  void _stopSettingsStream() {
-    _settingsStreamReconnectPending = false;
-    _settingsStreamReconnectAttempt = 0;
-
+  void _stopSettingsStream({bool resetAttempts = true}) {
+    _finishSettingsStream('intentional_stop');
+    _settingsStreamGeneration++;
+    _settingsStreamReconnectTimer?.cancel();
+    _settingsStreamReconnectTimer = null;
+    if (resetAttempts) _settingsStreamReconnectAttempt = 0;
     final cancelToken = _settingsStreamCancelToken;
     _settingsStreamCancelToken = null;
     cancelToken?.cancel('settings stream stopped');
-
     final subscription = _settingsStreamSubscription;
     _settingsStreamSubscription = null;
-    if (subscription != null) {
-      unawaited(subscription.cancel());
-    }
+    if (subscription != null) unawaited(subscription.cancel());
   }
 
-  void _scheduleSettingsStreamReconnect(MediaServerClient client) {
-    if (_settingsStreamReconnectPending) {
-      return;
-    }
+  void _finishSettingsStream(String reason, {Object? error}) {
+    final elapsed = _settingsStreamClock?.elapsedMicroseconds;
+    _settingsStreamSpan?.end(outcome: reason, data: {
+      'lastEventAgeUs': elapsed == null || _settingsStreamLastEventUs == null
+          ? null : elapsed - _settingsStreamLastEventUs!,
+      'connection': _settingsStreamGeneration,
+      if (error != null) 'kind': error is DioException ? error.type.name : error.runtimeType.toString(),
+      if (error is DioException) 'status': error.response?.statusCode,
+    });
+    _settingsStreamSpan = null;
+  }
 
-    final exponent = _settingsStreamReconnectAttempt < 6
-        ? _settingsStreamReconnectAttempt
-        : 6;
-    var delayMs = 1000 * (1 << exponent);
-    if (delayMs > 30000) {
-      delayMs = 30000;
-    }
-    if (_settingsStreamReconnectAttempt < 6) {
-      _settingsStreamReconnectAttempt += 1;
-    }
-
-    _settingsStreamReconnectPending = true;
-    unawaited(
-      Future<void>.delayed(Duration(milliseconds: delayMs), () async {
-        _settingsStreamReconnectPending = false;
-
-        final cancelToken = _settingsStreamCancelToken;
-        if (cancelToken == null || cancelToken.isCancelled) {
-          return;
-        }
-
-        if (!_pluginAvailable ||
-            !_prefs.get(UserPreferences.pluginSyncEnabled)) {
-          return;
-        }
-
-        await _startSettingsStream(client);
-      }),
-    );
+  void _scheduleSettingsStreamReconnect(MediaServerClient client, int generation) {
+    if (generation != _settingsStreamGeneration || _settingsStreamReconnectTimer != null) return;
+    final token = _settingsStreamCancelToken;
+    if (token == null || token.isCancelled) return;
+    final exponent = min(_settingsStreamReconnectAttempt, 5);
+    final baseMs = min(30000, 1000 * (1 << exponent));
+    final delayMs = min(30000, (baseMs * (.8 + _settingsStreamJitter.nextDouble() * .4)).round());
+    _settingsStreamReconnectAttempt = min(6, _settingsStreamReconnectAttempt + 1);
+    PerformanceTrace.event('settings.stream.reconnect_scheduled', {
+      'connection': generation, 'attempt': _settingsStreamReconnectAttempt, 'delayMs': delayMs,
+    });
+    _settingsStreamReconnectTimer = Timer(Duration(milliseconds: delayMs), () {
+      _settingsStreamReconnectTimer = null;
+      if (generation != _settingsStreamGeneration || token.isCancelled ||
+          !identical(token, _settingsStreamCancelToken) || !_pluginAvailable ||
+          !_prefs.get(UserPreferences.pluginSyncEnabled)) return;
+      unawaited(_startSettingsStream(client, reconnect: true));
+    });
   }
 
   Future<void> _handleSettingsStreamEvent(
@@ -562,7 +563,10 @@ class PluginSyncService extends ChangeNotifier {
   /// Sign-in leaves this running rather than waiting on it. The server can
   /// hold the first reply back until its heartbeat, and the stream reconnects
   /// on its own.
-  Future<void> _startSettingsStream(MediaServerClient client) async {
+  @visibleForTesting
+  Future<void> connectSettingsStreamForTesting(MediaServerClient client) => _startSettingsStream(client);
+
+  Future<void> _startSettingsStream(MediaServerClient client, {bool reconnect = false}) async {
     // Emby servers have no SSE endpoint, so plugin events arrive over the
     // session websocket instead. Don't loop on 501 reconnects here.
     if (client.serverType == ServerType.emby) {
@@ -578,10 +582,15 @@ class PluginSyncService extends ChangeNotifier {
       return;
     }
 
-    _stopSettingsStream();
+    _stopSettingsStream(resetAttempts: !reconnect);
 
     final cancelToken = CancelToken();
     _settingsStreamCancelToken = cancelToken;
+    final generation = _settingsStreamGeneration;
+    bool current() => generation == _settingsStreamGeneration && !cancelToken.isCancelled;
+    _settingsStreamClock = Stopwatch()..start();
+    _settingsStreamLastEventUs = null;
+    _settingsStreamSpan = PerformanceTrace.begin('settings.stream.connection', {'connection': generation});
 
     try {
       final response = await _dio.get<ResponseBody>(
@@ -590,15 +599,16 @@ class PluginSyncService extends ChangeNotifier {
         cancelToken: cancelToken,
       );
 
+      if (!current()) return;
+      _settingsStreamSpan?.mark('settings.stream.headers', {'status': response.statusCode, 'connection': generation});
       final body = response.data;
       if (body == null) {
-        if (!cancelToken.isCancelled) {
-          _scheduleSettingsStreamReconnect(client);
+        if (current()) {
+          _finishSettingsStream('empty_body');
+          _scheduleSettingsStreamReconnect(client, generation);
         }
         return;
       }
-
-      _settingsStreamReconnectAttempt = 0;
 
       _settingsStreamSubscription = body.stream
           .cast<List<int>>()
@@ -606,6 +616,12 @@ class PluginSyncService extends ChangeNotifier {
           .transform(const LineSplitter())
           .listen(
             (line) {
+              if (!current()) return;
+              _settingsStreamLastEventUs = _settingsStreamClock?.elapsedMicroseconds;
+              // Headers alone do not establish a healthy stream. Require
+              // actual data/heartbeat after a minute of connection lifetime.
+              if ((_settingsStreamClock?.elapsed.inSeconds ?? 0) >= 60) _settingsStreamReconnectAttempt = 0;
+              _settingsStreamSpan?.mark('settings.stream.data', {'connection': generation, 'heartbeat': !line.startsWith('data:')});
               if (!line.startsWith('data:')) {
                 return;
               }
@@ -617,21 +633,24 @@ class PluginSyncService extends ChangeNotifier {
 
               unawaited(_handleSettingsStreamEvent(client, payload));
             },
-            onError: (_) {
-              if (!cancelToken.isCancelled) {
-                _scheduleSettingsStreamReconnect(client);
+            onError: (Object error) {
+              if (current()) {
+                _finishSettingsStream('body_error', error: error);
+                _scheduleSettingsStreamReconnect(client, generation);
               }
             },
             onDone: () {
-              if (!cancelToken.isCancelled) {
-                _scheduleSettingsStreamReconnect(client);
+              if (current()) {
+                _finishSettingsStream('eof');
+                _scheduleSettingsStreamReconnect(client, generation);
               }
             },
             cancelOnError: false,
           );
-    } catch (_) {
-      if (!cancelToken.isCancelled) {
-        _scheduleSettingsStreamReconnect(client);
+    } catch (error) {
+      if (current()) {
+        _finishSettingsStream('connect_error', error: error);
+        _scheduleSettingsStreamReconnect(client, generation);
       }
     }
   }

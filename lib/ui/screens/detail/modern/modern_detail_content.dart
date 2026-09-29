@@ -545,6 +545,7 @@ class _ModernDetailContentState extends State<ModernDetailContent> {
     };
 
     _vm.addListener(_onViewModelChanged);
+    _requestSeriesEpisodes();
     _scrollController.addListener(_onScroll);
     // With Expanded Tabs off the tabs start collapsed on every platform and are
     // opened by clicking; Seasons always start expanded.
@@ -573,6 +574,11 @@ class _ModernDetailContentState extends State<ModernDetailContent> {
   @override
   void didUpdateWidget(ModernDetailContent oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.viewModel, widget.viewModel)) {
+      oldWidget.viewModel.removeListener(_onViewModelChanged);
+      _vm.addListener(_onViewModelChanged);
+      _requestSeriesEpisodes();
+    }
     if (widget.initialFocusNode != oldWidget.initialFocusNode && PlatformDetection.isTV) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || !canClaimInitialFocus(context)) return;
@@ -612,7 +618,14 @@ class _ModernDetailContentState extends State<ModernDetailContent> {
     }
   }
 
+  void _requestSeriesEpisodes() {
+    if (_vm.item?.type == 'Series') {
+      unawaited(_vm.loadAllSeriesEpisodes(caller: 'modern_lifecycle'));
+    }
+  }
+
   void _onViewModelChanged() {
+    _requestSeriesEpisodes();
     if (mounted) {
       // A new collection, or one whose list restarted after a sort change,
       // needs the trigger to fire again from wherever the scroll now sits.
@@ -1468,6 +1481,14 @@ class _ModernDetailContentState extends State<ModernDetailContent> {
   Widget _seriesEpisodesTab(BuildContext context, AggregatedItem item) {
     final l10n = AppLocalizations.of(context);
     final episodes = _vm.seriesEpisodes;
+    if (episodes.isEmpty && _vm.seriesEpisodesError != null) {
+      return Center(child: TextButton.icon(
+        focusNode: _episodesFirstFocusNode,
+        onPressed: () => _vm.refreshSeriesEpisodes(),
+        icon: const Icon(Icons.refresh),
+        label: Text(l10n.retry),
+      ));
+    }
     if (episodes.isEmpty) {
       return _reservedTabBody(
         focusNode: _episodesFirstFocusNode,
@@ -5016,9 +5037,6 @@ class _ModernDetailContentState extends State<ModernDetailContent> {
     if (item == null) return const SizedBox.shrink();
     _upNextResolvedThisBuild = false;
 
-    if (item.type == 'Series') {
-      _vm.loadAllSeriesEpisodes(caller: 'modern_build');
-    }
 
     final l10n = AppLocalizations.of(context);
     final textTheme = Theme.of(context).textTheme;

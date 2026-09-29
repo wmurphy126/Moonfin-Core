@@ -160,6 +160,12 @@ class ArtworkRequestScheduler {
   }
 
   _Waiter? _next(DateTime now) {
+    _Waiter? aged;
+    for (final waiter in _waiting.values) {
+      if (now.difference(waiter.enqueuedAt) >= maxWait &&
+          (aged == null || waiter.enqueuedAt.isBefore(aged.enqueuedAt))) aged = waiter;
+    }
+    if (aged != null) return aged;
     for (final lane in ImageFetchPriority.values) {
       final batches = _lanes[lane]!;
       if (batches.isEmpty) continue;

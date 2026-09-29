@@ -36,6 +36,11 @@ class PerformanceRecordingOverlay extends StatelessWidget {
                     icon: const Icon(Icons.flag_outlined, color: Colors.orange),
                   ),
                   IconButton(
+                    tooltip: 'Mark completed browse/play cycle',
+                    onPressed: recorder.cycleCheckpoint,
+                    icon: const Icon(Icons.repeat, color: Colors.white),
+                  ),
+                  IconButton(
                     tooltip: 'Hide recording overlay',
                     onPressed: () => recorder.overlay(false),
                     icon: const Icon(

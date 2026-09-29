@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
+import '../utils/async_work_pool.dart';
 import 'package:server_core/server_core.dart';
 
 import '../../preference/preference_constants.dart';
@@ -77,6 +79,53 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
   static const _localRowsFetchLimit = 15;
 
   SeerrDiscoverViewModel(this._repo, this._prefs);
+  final _enrichment = AsyncWorkPool(4);
+  final _generationKey = Object();
+  int _generation = 0;
+  bool _disposed = false, _notificationPending = false;
+  bool _everAttached = false;
+  final Set<Object> _consumers = {};
+  SeerrRowType? _visibleRow;
+  bool get _visible => !_everAttached || _consumers.isNotEmpty;
+  void attach(Object owner) {
+    _everAttached = true;
+    _consumers.add(owner);
+    PerformanceTrace.event('discover.consumers', {'count': _consumers.length});
+    if (!_isLoading) _resumeBaseRows();
+    for (final row in _rows) {
+      if (row.type == SeerrRowType.recentRequests || row.type == SeerrRowType.yourWatchlist || row.type == SeerrRowType.recentlyAdded) {
+        _enrichRow(row.type, row.items, _generation);
+      }
+    }
+  }
+  bool _resumingBase = false;
+  void _resumeBaseRows() {
+    if (_resumingBase || _disposed || !_visible) return;
+    final generation = _generation;
+    final types = _rows.where((row) => row.isLoading).map((row) => row.type).toList();
+    if (types.isEmpty) return;
+    _resumingBase = true;
+    unawaited(mapBounded<SeerrRowType, void>(types, 2, (type) async {
+      if (_disposed || !_visible || generation != _generation) return;
+      final index = _rows.indexWhere((row) => row.type == type);
+      if (index >= 0) await runZoned(() => _loadRow(index), zoneValues: {_generationKey: generation});
+    }).whenComplete(() => _resumingBase = false));
+  }
+
+  void detach(Object owner) {
+    _consumers.remove(owner);
+    PerformanceTrace.event('discover.consumers', {'count': _consumers.length});
+  }
+  void prioritize(SeerrRowType row) => _visibleRow = row;
+
+  void _coalescedNotify() {
+    if (_disposed || _notificationPending) return;
+    _notificationPending = true;
+    SchedulerBinding.instance.scheduleFrameCallback((_) {
+      _notificationPending = false;
+      if (!_disposed) notifyListeners();
+    });
+  }
 
   static const _nsfwKeywords = [
     r'\bsex\b', 'sexual', r'\bporn\b', 'erotic', r'\bnude\b', 'nudity',
@@ -127,67 +176,75 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
     SeerrStudio(id: 41077, name: 'A24', logoPath: 'https://image.tmdb.org/t/p/w780_filter(duotone,ffffff,bababa)/1ZXsGaFPgrgS6ZZGS37AqD5uU12.png'),
   ];
 
-  Future<void> load() =>
-      PerformanceTrace.measure('seerr.discover.load', _loadRecorded);
+  Future<void> load() => _load(force: false);
 
-  Future<void> _loadRecorded() async {
+  Future<void> _load({required bool force}) => PerformanceTrace.measure(
+    'seerr.discover.load', () => _loadRecorded(force: force));
+
+  Future<void> _loadRecorded({required bool force}) async {
+    if (_disposed || (_isLoading && !force)) return;
+    final generation = ++_generation;
+    bool current() => !_disposed && generation == _generation;
     PerformanceTrace.observed(this, 'discover');
-    if (_isLoading) return;
     _isLoading = true;
     _error = null;
     notifyListeners();
-
     try {
-      await PerformanceTrace.measure('seerr.initialize',
-          () => _repo.ensureInitialized(force: true));
+      await PerformanceTrace.measure('seerr.initialize', () => _repo.ensureInitialized(force: force));
+      if (!current()) return;
       if (!_repo.isAvailable) {
-        _isLoading = false;
-        _error = _repo.serverReportsEnabled
-            ? 'Sign in to Seerr to see recommendations'
-            : 'Seerr is not configured or unavailable';
-        notifyListeners();
+        _error = _repo.serverReportsEnabled ? 'Sign in to Seerr to see recommendations' : 'Seerr is not configured or unavailable';
         return;
       }
-
       final activeRows = _prefs.activeRows;
-      await _refreshRecentlyAddedGate(activeRows);
-      _rows = _visibleRows(activeRows).map((type) => SeerrDiscoverRow(
-        type: type,
-        isLoading: true,
-      )).toList();
+      _rows = activeRows.map((type) => SeerrDiscoverRow(type: type, isLoading: true)).toList();
       notifyListeners();
-
-      await _loadAllRows();
+      // Permission-dependent content waits for the gate; unrelated rows do not.
+      final permission = _refreshRecentlyAddedGate(activeRows).then((allowed) async {
+        if (!current()) return;
+        _canViewRecentlyAdded = allowed;
+        final index = _rows.indexWhere((r) => r.type == SeerrRowType.recentlyAdded);
+        if (index < 0) return;
+        if (!_canViewRecentlyAdded) {
+          _rows = _rows.where((r) => r.type != SeerrRowType.recentlyAdded).toList();
+          notifyListeners();
+        } else {
+          await runZoned(() => _loadRow(index), zoneValues: {_generationKey: generation});
+        }
+      });
+      // Store types, not indices: resolving permissions can remove a row.
+      final types = activeRows.where((r) => r != SeerrRowType.recentlyAdded).toList();
+      await Future.wait([
+        permission,
+        mapBounded<SeerrRowType, void>(types, 2, (type) async {
+          if (!current() || !_visible) return;
+          final index = _rows.indexWhere((r) => r.type == type);
+          if (index >= 0) await runZoned(() => _loadRow(index), zoneValues: {_generationKey: generation});
+        }),
+      ]);
     } catch (e) {
-      _error = e;
-      debugPrint('[SeerrDiscover] Failed to load: $e');
+      if (current()) _error = e;
     } finally {
-      _isLoading = false;
-      notifyListeners();
+      if (current()) { _isLoading = false; notifyListeners(); }
     }
   }
 
-  Future<void> refresh() async {
-    _rows = [];
-    notifyListeners();
-    await load();
-  }
+  Future<void> refresh() => _load(force: true);
 
   // Seerr does not enforce the "View Recently Added" (RECENT_VIEW) permission
   // at the API layer; its own frontend hides the section. We are that frontend
   // here, so replicate the gate and drop the Recently Added row for users who
   // lack the permission. Owners and admins bypass via hasPermission.
-  Future<void> _refreshRecentlyAddedGate(List<SeerrRowType> requested) async {
+  Future<bool> _refreshRecentlyAddedGate(List<SeerrRowType> requested) async {
     if (!requested.contains(SeerrRowType.recentlyAdded)) {
-      _canViewRecentlyAdded = true;
-      return;
+      return true;
     }
     try {
       final user = await _repo.getCurrentUser();
-      _canViewRecentlyAdded = user.hasPermission(SeerrPermission.recentView);
+      return user.hasPermission(SeerrPermission.recentView);
     } catch (e) {
       debugPrint('[SeerrDiscover] Recently Added permission check failed: $e');
-      _canViewRecentlyAdded = true;
+      return false;
     }
   }
 
@@ -217,6 +274,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
   Future<void> loadMore(int rowIndex) async {
     if (rowIndex < 0 || rowIndex >= _rows.length) return;
     final row = _rows[rowIndex];
+    final generation = _generation;
     if (!row.hasMore || row.isLoading || !row.isMediaRow) return;
 
     _rows = List.of(_rows);
@@ -228,32 +286,39 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
       if (page != null) {
         List<SeerrDiscoverItem> newItems;
         if (row.type == SeerrRowType.yourWatchlist) {
-          newItems = await Future.wait(page.results.map(_enrichRequestItem));
+          newItems = page.results;
         } else {
           newItems = _filterItems(page.results);
         }
+        if (_disposed || generation != _generation) return;
+        final currentIndex = _rows.indexWhere((r) => r.type == row.type);
+        if (currentIndex < 0) return;
         _rows = List.of(_rows);
-        _rows[rowIndex] = row.copyWith(
-          items: [...row.items, ...newItems],
+        final latest = _rows[currentIndex];
+        final existingIds = latest.items.map((e) => (e.mediaType, e.id)).toSet();
+        _rows[currentIndex] = latest.copyWith(
+          items: [...latest.items, ...newItems.where((e) => existingIds.add((e.mediaType, e.id)))],
           page: page.page,
           totalPages: page.totalPages,
           isLoading: false,
         );
+        if (row.type == SeerrRowType.yourWatchlist) _enrichRow(row.type, newItems, generation);
       } else {
+        if (_disposed || generation != _generation) return;
+        final currentIndex = _rows.indexWhere((r) => r.type == row.type);
+        if (currentIndex < 0) return;
         _rows = List.of(_rows);
-        _rows[rowIndex] = row.copyWith(isLoading: false);
+        _rows[currentIndex] = _rows[currentIndex].copyWith(isLoading: false);
       }
     } catch (e) {
+      if (_disposed || generation != _generation) return;
+      final currentIndex = _rows.indexWhere((r) => r.type == row.type);
+      if (currentIndex < 0) return;
       debugPrint('[SeerrDiscover] Failed to load more for ${row.type}: $e');
       _rows = List.of(_rows);
-      _rows[rowIndex] = row.copyWith(isLoading: false);
+      _rows[currentIndex] = _rows[currentIndex].copyWith(isLoading: false);
     }
     notifyListeners();
-  }
-
-  Future<void> _loadAllRows() async {
-    final indices = List.generate(_rows.length, (i) => i);
-    await mapBounded<int, void>(indices, 2, (index) => _loadRow(index));
   }
 
   Future<void> _loadRow(int index) => PerformanceTrace.measure(
@@ -328,13 +393,14 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
     final row = _rows[index];
     try {
       final page = await _repo.getWatchlist(page: 1);
-      final items = await Future.wait(page.results.map(_enrichRequestItem));
+      final items = page.results;
       _updateRow(index, row.copyWith(
         items: items,
         page: page.page,
         totalPages: page.totalPages,
         isLoading: false,
       ));
+      _enrichRow(row.type, items, Zone.current[_generationKey] as int? ?? _generation);
     } catch (_) {
       PerformanceTrace.event('seerr.row.error', {'row': row.type.name});
       _updateRow(index, row.copyWith(isLoading: false));
@@ -345,16 +411,19 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
     final row = _rows[index];
     try {
       final media = await _repo.getRecentlyAdded(limit: _localRowsFetchLimit);
-      final items = await Future.wait(media.map(_mediaToDiscoverItem));
+      final items = media.map(_mediaToDiscoverItem).toList();
       _updateRow(index, row.copyWith(items: items, isLoading: false));
+      if (row.type == SeerrRowType.recentRequests || row.type == SeerrRowType.recentlyAdded) {
+        _enrichRow(row.type, items, Zone.current[_generationKey] as int? ?? _generation);
+      }
     } catch (_) {
       PerformanceTrace.event('seerr.row.error', {'row': row.type.name});
       _updateRow(index, row.copyWith(isLoading: false));
     }
   }
 
-  Future<SeerrDiscoverItem> _mediaToDiscoverItem(SeerrMedia media) =>
-      _enrichRequestItem(SeerrDiscoverItem(
+  SeerrDiscoverItem _mediaToDiscoverItem(SeerrMedia media) =>
+      SeerrDiscoverItem(
         id: media.tmdbId ?? media.id,
         title: media.title,
         name: media.name,
@@ -369,7 +438,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
           tmdbId: media.tmdbId,
           status: media.status,
         ),
-      ));
+      );
 
   Future<void> _loadRecentRequests(int index) async {
     final row = _rows[index];
@@ -403,9 +472,12 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
           })
           .toList();
 
-      final items = await Future.wait(rawItems.map(_enrichRequestItem));
+      final items = rawItems;
 
       _updateRow(index, row.copyWith(items: items, isLoading: false));
+      if (row.type == SeerrRowType.recentRequests || row.type == SeerrRowType.recentlyAdded) {
+        _enrichRow(row.type, items, Zone.current[_generationKey] as int? ?? _generation);
+      }
     } catch (e) {
       PerformanceTrace.event('seerr.row.error', {'row': row.type.name, 'kind': e.runtimeType.toString()});
       debugPrint('[SeerrDiscover] Failed to load requests: $e');
@@ -413,12 +485,42 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
     }
   }
 
+  final Set<(int, SeerrRowType, String?, int)> _enrichingItems = {};
+  bool isEnriching(SeerrRowType type, SeerrDiscoverItem item) =>
+      _enrichingItems.contains((_generation, type, item.mediaType, item.id));
+  void _enrichRow(SeerrRowType type, List<SeerrDiscoverItem> items, int generation) {
+    if (_disposed || !_visible || generation != _generation) return;
+    final pending = items.where((item) => _enrichingItems.add(
+      (generation, type, item.mediaType, item.id))).toList();
+    unawaited(mapBounded<SeerrDiscoverItem, void>(pending, 4, (item) async {
+      try {
+      final result = await _enrichment.run(() => _enrichRequestItem(item),
+        isCurrent: () => !_disposed && _visible && generation == _generation,
+        priority: () => _visibleRow == type ? 0 : 1);
+      if (result == null || _disposed || generation != _generation) return;
+      final index = _rows.indexWhere((r) => r.type == type);
+      if (index < 0) return;
+      final row = _rows[index];
+      final patched = [for (final existing in row.items)
+        if (existing.id == item.id && existing.mediaType == item.mediaType) result else existing];
+      _rows = List.of(_rows)..[index] = row.copyWith(items: patched);
+      PerformanceTrace.event('seerr.row.enrichment', {'row': type.name,
+        'running': _enrichment.running, 'pending': _enrichment.pending});
+      _coalescedNotify();
+      } finally {
+        _enrichingItems.remove((generation, type, item.mediaType, item.id));
+      }
+    }));
+  }
+
   Future<SeerrDiscoverItem> _enrichRequestItem(SeerrDiscoverItem item) =>
       PerformanceTrace.measure('seerr.item.enrich', () => _enrichRequestItemRecorded(item),
         data: {'needed': item.backdropPath == null || item.voteAverage == null});
 
   Future<SeerrDiscoverItem> _enrichRequestItemRecorded(SeerrDiscoverItem item) async {
-    if (item.backdropPath != null && item.voteAverage != null) {
+    if (item.backdropPath != null && item.voteAverage != null &&
+        item.posterPath != null &&
+        (item.title?.isNotEmpty == true || item.name?.isNotEmpty == true)) {
       return item;
     }
 
@@ -543,11 +645,18 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
   @override
   void dispose() {
     _diagnosticDisposed = true;
+    _disposed = true;
+    _generation++;
+    _consumers.clear();
     PerformanceTrace.disposed(this, 'discover');
     super.dispose();
   }
 
   void _updateRow(int index, SeerrDiscoverRow row) {
+    final generation = Zone.current[_generationKey] as int? ?? _generation;
+    if (_disposed || generation != _generation) return;
+    index = _rows.indexWhere((r) => r.type == row.type);
+    if (index < 0) return;
     _rows = List.of(_rows);
     _rows[index] = row;
     PerformanceTrace.event('seerr.row.data.ready', {

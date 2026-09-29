@@ -56,6 +56,8 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
   PerformanceSpan? _buffering;
   Map<String, Object?>? _mediaState;
   Map<String, Object?>? _decoderCounters;
+  Map<String, Object?>? _previousDecoderSample;
+  int _cycle = 0;
   PerformanceSpan? _firstPlaying, _seek;
   PlaybackBringupPhase? _previousPhase;
   int? _seekNativeUs, _mediaStateReceivedUs, _networkSampleUs, _networkBytes;
@@ -118,9 +120,11 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       _mediaActive = false;
       _nativePlayer = null;
       _nativeSeek = null;
+      _cycle = 0;
       _displayHz = null;
       _displaySampleUs = null;
       _decoderCounters = null;
+      _previousDecoderSample = null;
       _mediaStateReceivedUs = null;
       _networkSampleUs = null;
       _networkBytes = null;
@@ -308,6 +312,15 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  void cycleCheckpoint() {
+    if (!recording) return;
+    _accept('user.cycle', {'cycle': ++_cycle, 'playerActive': _mediaActive});
+    status = 'Cycle $_cycle checkpoint recorded.';
+    unawaited(_sample(detailed: true));
+    unawaited(_flush());
+    notifyListeners();
+  }
+
   void overlay(bool value) {
     showOverlay = value;
     notifyListeners();
@@ -417,8 +430,14 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
           _networkSampleUs = nativeUs;
           _networkBytes = bytes;
         }
-        if (_decoderCounters != null)
-          _accept('media.decoder.counters', _decoderCounters!);
+        if (_decoderCounters != null) {
+          _accept('media.decoder.counters', {
+            ..._decoderCounters!,
+            ...decoderCounterDeltas(_decoderCounters!, _previousDecoderSample),
+            'seekInProgress': _seek != null,
+          });
+          _previousDecoderSample = _decoderCounters;
+        }
         final cache = PaintingBinding.instance.imageCache;
         _accept('cache.images', {
           'entries': cache.currentSize,
@@ -653,6 +672,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       _mediaActive = false;
       _mediaState = null;
       _decoderCounters = null;
+      _previousDecoderSample = null;
       _networkBytes = null;
       _networkSampleUs = null;
       _mainTitle?.end(outcome: state.phase.name);
@@ -680,6 +700,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     _seekId = null;
     _hadFrame = false;
     _decoderCounters = null;
+    _previousDecoderSample = null;
     _networkBytes = null;
     _networkSampleUs = null;
     _mediaState = null;
@@ -714,6 +735,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       _mediaActive = false;
       _mediaState = null;
       _decoderCounters = null;
+      _previousDecoderSample = null;
       _networkBytes = null;
       _networkSampleUs = null;
     }
