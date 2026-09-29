@@ -92,7 +92,7 @@ class _MinimalistEpisodesSectionState extends State<MinimalistEpisodesSection> {
     final viewModel = _vm;
     if (viewModel.seriesEpisodes.isNotEmpty) return;
     unawaited(
-      viewModel.loadAllSeriesEpisodes().whenComplete(() {
+      viewModel.loadAllSeriesEpisodes(caller: 'minimalist').whenComplete(() {
         if (!mounted || !identical(_vm, viewModel)) return;
         setState(() {});
       }),

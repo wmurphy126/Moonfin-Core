@@ -10,6 +10,10 @@ class PerformanceRecording {
   final Queue<String> _pending = Queue();
   final Map<String, _Aggregate> _durations = {};
   final Map<int, String> _active = {};
+  final Map<int, Map<String, Object?>> _spanContext = {};
+  final Map<int, (String, int)> _requestCounts = {};
+  final Map<String, int> _outcomes = {};
+  final List<Map<String, Object?>> _markers = [];
   final Map<int, String> _requests = {};
   final Map<String, int> _requestPeaks = {};
   final Map<String, List<double>> _resources = {};
@@ -43,12 +47,15 @@ class PerformanceRecording {
     'metric',
     'source',
     'kind',
+    'caller',
+    'idKind',
+    'row',
   };
   static final _safe = RegExp(r'^[a-zA-Z0-9_./:+ -]{1,160}$');
 
   static Map<String, Object?> sanitize(Map<String, Object?> data) {
     final out = <String, Object?>{};
-    for (final entry in data.entries.take(40)) {
+    for (final entry in data.entries.take(96)) {
       if (!RegExp(r'^[a-zA-Z][a-zA-Z0-9_]{0,39}$').hasMatch(entry.key))
         continue;
       if (RegExp(
@@ -72,6 +79,14 @@ class PerformanceRecording {
   void add(String event, Map<String, Object?> attributes) {
     if (!_safe.hasMatch(event)) return;
     final data = sanitize(attributes);
+    if (event == 'span.end') {
+      final context = _spanContext.remove(data['id']);
+      if (context != null) {
+        for (final entry in context.entries) {
+          data.putIfAbsent(entry.key, () => entry.value);
+        }
+      }
+    }
     final record = <String, Object?>{
       'tUs': clock.elapsedMicroseconds,
       'event': event,
@@ -84,8 +99,30 @@ class PerformanceRecording {
     _counts[countKey] = (_counts[countKey] ?? 0) + 1;
     if (event == 'span.begin' && data['id'] is int && _active.length < 512) {
       _active[data['id'] as int] = name;
+      _spanContext[data['id'] as int] = {
+        for (final key in [
+          'caller',
+          'idKind',
+          'seerrOnly',
+          'row',
+          'kind',
+          'requestAlias',
+          'visit',
+        ])
+          if (data.containsKey(key)) key: data[key],
+      };
       if (name == 'http.request') {
         final endpoint = data['endpoint'] as String? ?? 'unknown';
+        final alias = data['requestAlias'];
+        if (alias is int &&
+            alias != 0 &&
+            (_requestCounts.length < 4096 ||
+                _requestCounts.containsKey(alias))) {
+          _requestCounts[alias] = (
+            endpoint,
+            (_requestCounts[alias]?.$2 ?? 0) + 1,
+          );
+        }
         _requests[data['id'] as int] = endpoint;
         final active = _requests.values
             .where((value) => value == endpoint)
@@ -99,6 +136,10 @@ class PerformanceRecording {
     if (event == 'span.end') {
       _active.remove(data['id']);
       _requests.remove(data['id']);
+      final key = '$name ${data['outcome'] ?? 'unknown'}';
+      if (_outcomes.length < 256 || _outcomes.containsKey(key)) {
+        _outcomes[key] = (_outcomes[key] ?? 0) + 1;
+      }
     }
     if (event == 'resources.sample') {
       for (final key in [
@@ -109,6 +150,19 @@ class PerformanceRecording {
         'nativeAllocatedBytes',
         'fdCount',
         'threads',
+        'graphicsKiB',
+        'privateOtherKiB',
+        'javaCommittedBytes',
+        'javaLimitBytes',
+        'artGcCountDelta',
+        'artGcTimeMsDelta',
+        'artBlockingGcCountDelta',
+        'artBlockingGcTimeMsDelta',
+        'artBytesAllocatedDelta',
+        'artBytesFreedDelta',
+        'sampleCostUs',
+        'bridgeRoundTripUs',
+        'mainHeartbeatMaxDelayMs',
       ]) {
         final value = data[key];
         if (value is! num) continue;
@@ -120,7 +174,17 @@ class PerformanceRecording {
         if (value > metrics[2]) metrics[2] = value.toDouble();
       }
     }
-    if (event == 'user.marker') markers++;
+    if (event == 'user.marker') {
+      markers++;
+      if (_markers.length < 100)
+        _markers.add({
+          ...record,
+          'activeSpans': _active.length,
+          'activeRequests': _requests.length,
+          'lastPssKiB': _resources['pssKiB']?[1],
+          'lastCpuOneCorePercent': _resources['cpuOneCorePercent']?[1],
+        });
+    }
     if (event == 'resource.observed' &&
         data['resource'] is int &&
         _ownedResources.length < 512) {
@@ -130,9 +194,13 @@ class PerformanceRecording {
     if (event == 'resource.disposed') _ownedResources.remove(data['resource']);
     final duration = data['durationUs'];
     if (duration is num) {
-      final label = name == 'http.request'
+      var label = name == 'http.request'
           ? '$name ${data['method'] ?? ''} ${data['endpoint'] ?? ''}'
           : name;
+      if (data['kind'] != null) label += ' ${data['kind']}';
+      if (event == 'span.end' && data['outcome'] != 'ok') {
+        label += ' [${data['outcome'] ?? 'unknown'}]';
+      }
       final key = _durations.containsKey(label) || _durations.length < 128
           ? label
           : 'other';
@@ -167,7 +235,7 @@ class PerformanceRecording {
 
   String summary({required bool complete}) {
     final text = StringBuffer()
-      ..writeln('Moonfin performance recording — schema 1')
+      ..writeln('Moonfin performance recording — schema 2')
       ..writeln('Started UTC: ${started.toIso8601String()}')
       ..writeln(
         'Duration: ${(clock.elapsedMilliseconds / 1000).toStringAsFixed(1)} seconds',
@@ -181,14 +249,18 @@ class PerformanceRecording {
       ..writeln(
         'CPU 100% = one occupied core. RSS/PSS overlap; do not add them.',
       )
-      ..writeln('ART GC counters cover Java/Kotlin, not the Dart heap. This recording does not contain heap snapshots or GPU utilization.')
+      ..writeln(
+        'ART GC counters cover Java/Kotlin, not the Dart heap. This recording does not contain heap snapshots or GPU utilization.',
+      )
       ..writeln(
         'Memory growth is not proof of a leak. Compare repeated equivalent cycles after warmup.',
       )
       ..writeln(
         'Request time is client-observed; header wait includes connection/network/server work.',
       )
-      ..writeln('http.dispatched duration = client queue wait; http.headers duration = dispatch to headers; http.request also includes body/decoding except streamed responses.')
+      ..writeln(
+        'http.dispatched duration = client queue wait; http.headers duration = dispatch to headers; http.request also includes body/decoding except streamed responses.',
+      )
       ..writeln(
         'Frame summaries describe Flutter UI; media frame drops are reported separately.',
       )
@@ -200,6 +272,24 @@ class PerformanceRecording {
       )
       ..writeln(
         'Native media events use nativeUs monotonic timestamps; tUs is Dart receipt time and includes bridge delay. Resource samples link the two clocks.',
+      )
+      ..writeln(
+        'play.tap_to_playing is distinct from the first picture. media.seek timings start at the native accepted-position change, not the finger gesture.',
+      )
+      ..writeln(
+        'media.seek_command measures Dart command dispatch/acknowledgment. position.advancing requires 50ms of position movement while playing, observed on the existing 250ms state ticker. prepare.returned measures synchronous setup, not decoder readiness.',
+      )
+      ..writeln(
+        'networkBytes counts live network reads including canceled loads. Completed-load bytes are separate. Transfer end is not necessarily successful completion; source changes reset counters.',
+      )
+      ..writeln(
+        'Artwork ready uses the existing image builder; viewport paint is a bounds-overlap estimate, not an occlusion test. Local-file images and non-CachedNetworkImage widgets are outside this coverage.',
+      )
+      ..writeln(
+        'GC deltas are Java/ART collection work, not UI pause durations. Detailed memory is sampled every ten seconds and on markers when the sampler is free. Unknown or unavailable measurements are not zero.',
+      )
+      ..writeln(
+        'Diagnostic overhead: sampleCostUs is worker collection cost; bridgeRoundTripUs includes platform scheduling; diagnostics.writer measures serialization and journal writes. Native and Dart heartbeat delays describe different threads. requestAtUs/replyAtUs bound clock alignment uncertainty.',
       )
       ..writeln(
         '\nDuration summary (ms; recent p95 uses at most 256 samples):',
@@ -220,6 +310,27 @@ class PerformanceRecording {
     );
     for (final entry in _requestPeaks.entries) {
       text.writeln('${entry.key}: ${entry.value}');
+    }
+    text.writeln(
+      '\nRepeated request aliases (same method/path/parameters, credentials excluded; repeats may be intentional):',
+    );
+    final repeated =
+        _requestCounts.entries.where((e) => e.value.$2 > 1).toList()
+          ..sort((a, b) => b.value.$2.compareTo(a.value.$2));
+    for (final entry in repeated.take(30)) {
+      text.writeln(
+        'request ${entry.key}: ${entry.value.$1} count=${entry.value.$2}',
+      );
+    }
+    text.writeln(
+      '\nOperation outcomes (incomplete/failed timings are kept separate):',
+    );
+    for (final entry in _outcomes.entries) {
+      text.writeln('${entry.key}: ${entry.value}');
+    }
+    text.writeln('\nProblem markers and nearby sampled resource state:');
+    for (final marker in _markers) {
+      text.writeln(jsonEncode(marker));
     }
     text.writeln(
       '\nLongest operations (overlapping durations must not be summed):',

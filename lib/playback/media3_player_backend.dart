@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart';
 import 'package:get_it/get_it.dart';
 import 'package:playback_core/playback_core.dart';
+import 'package:server_core/server_core.dart' show PerformanceTrace;
 
 import '../data/services/log_service.dart';
 import '../preference/preference_constants.dart';
@@ -1203,7 +1204,10 @@ class Media3PlayerBackend extends PlayerBackend {
 
   @override
   Future<void> seekTo(Duration position) async {
-    await _invoke<void>('seek', {'positionMs': position.inMilliseconds});
+    await PerformanceTrace.measure('media.seek_command',
+      () => _invoke<void>('seek', {'positionMs': position.inMilliseconds}),
+      data: {'fromMs': _position.inMilliseconds,
+        'targetMs': position.inMilliseconds, 'isPlaying': _isPlaying});
   }
 
   @override

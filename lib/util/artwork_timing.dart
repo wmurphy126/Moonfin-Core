@@ -30,14 +30,26 @@ class ArtworkTiming {
 
   developer.TimelineTask? _task;
   bool _finished = false;
+  PerformanceSpan? _performance;
+  int? _admittedUs, _headersUs;
 
   void admitted({int batch = 0, int queueDepth = 0}) {
     admittedAt = DateTime.now();
     this.batch = batch;
     this.queueDepth = queueDepth;
+    _admittedUs = _performance?.elapsedUs;
+    _performance?.mark('artwork.admitted', {
+      'durationUs': _admittedUs, 'batch': batch, 'queued': queueDepth,
+    });
   }
 
-  void headers() => headersAt = DateTime.now();
+  void headers() {
+    headersAt = DateTime.now();
+    _headersUs = _performance?.elapsedUs;
+    _performance?.mark('artwork.headers', {
+      'durationUs': (_headersUs ?? 0) - (_admittedUs ?? 0),
+    });
+  }
 
   void chunk(int length) => bytes += length;
 
@@ -92,6 +104,13 @@ class ArtworkTimings {
     if (!enabled) return null;
     _inFlight++;
     final timing = ArtworkTiming._(loggableArtworkUrl(url), DateTime.now());
+    if (PerformanceTrace.enabled) {
+      final uri = Uri.tryParse(url);
+      timing._performance = PerformanceTrace.begin('artwork.fetch', {
+        if (uri != null && uri.hasAuthority)
+          'imageSource': PerformanceTrace.alias('image:${uri.origin}${uri.path}'),
+      });
+    }
     if (!kReleaseMode) {
       timing._task = developer.TimelineTask()
         ..start('artwork', arguments: <String, Object?>{'url': timing.url});
@@ -104,6 +123,15 @@ class ArtworkTimings {
     timing._finished = true;
     _inFlight--;
     timing.done();
+    timing._performance?.end(
+      outcome: timing.error == null ? 'ok' : 'error',
+      data: {
+        'bytes': timing.bytes,
+        'queueUs': timing._admittedUs,
+        if (timing._headersUs != null)
+          'bodyUs': timing._performance!.elapsedUs - timing._headersUs!,
+      },
+    );
     timing._task?.finish(
       arguments: <String, Object?>{
         'bytes': timing.bytes,

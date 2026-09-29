@@ -227,15 +227,15 @@ class SearchViewModel extends ChangeNotifier {
     String query,
     List<SearchResultGroup> activeGroups,
   ) async {
-    final peopleFuture = _searchRepository
-        .searchPeople(query, limit: _resultLimit)
+    final peopleFuture = PerformanceTrace.measure('search.people',
+        () => _searchRepository.searchPeople(query, limit: _resultLimit))
         .catchError((_) => <AggregatedItem>[]);
-    final channelsFuture = _channelMatches(query);
-    final allItems = await _searchRepository.search(
-      query,
-      parentId: _scopedParentId,
-      limit: _globalFetchLimit,
-    );
+    final channelsFuture = PerformanceTrace.measure('search.channels',
+        () => _channelMatches(query));
+    final allItems = await PerformanceTrace.measure('search.items',
+      () => _searchRepository.search(query,
+        parentId: _scopedParentId, limit: _globalFetchLimit));
+    PerformanceTrace.event('search.items.data.ready', {'items': allItems.length});
     final people = await peopleFuture;
     final channels = await channelsFuture;
 

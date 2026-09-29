@@ -5,6 +5,7 @@ import 'performance_trace.dart';
 /// URLs, query parameters, headers and response bodies never reach the sink.
 class PerformanceInterceptor extends Interceptor {
   static const _key = 'moonfin.performance.span';
+  static const _headersKey = 'moonfin.performance.headersUs';
   static final _segments = <String>{
     'items',
     'users',
@@ -92,11 +93,33 @@ class PerformanceInterceptor extends Interceptor {
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
     if (PerformanceTrace.enabled) {
+      // Equality aliases are local to one recording. Credentials are excluded
+      // even from the in-memory key; no key or parameter value reaches the sink.
+      final parameters = Map<String, dynamic>.from(options.queryParameters)
+        ..removeWhere(
+          (key, _) => RegExp(
+            r'token|key|auth|password',
+            caseSensitive: false,
+          ).hasMatch(key),
+        );
+      final keys = parameters.keys.toList()..sort();
+      final alias = PerformanceTrace.alias(
+        '${options.method} ${options.uri.origin}${options.uri.path} '
+        '${keys.map((key) => '$key=${parameters[key]}').join('&')}',
+      );
       options.extra[_key] = PerformanceTrace.begin('http.request', {
         'method': options.method,
         'endpoint': endpoint(options.uri),
         'server': PerformanceTrace.alias(options.uri.origin),
         'retry': options.extra['moonfin.connectionRetry'] == true,
+        'requestAlias': alias,
+        'parameterCount': keys.length,
+        'streamed': options.responseType == ResponseType.stream,
+        'callerCancellation': options.cancelToken != null,
+        'connectTimeoutMs': options.connectTimeout?.inMilliseconds,
+        'receiveTimeoutMs': options.receiveTimeout?.inMilliseconds,
+        if (options.uri.pathSegments.any((s) => s.startsWith('tmdb:')))
+          'idKind': 'tmdb_synthetic',
       });
     }
     handler.next(options);
@@ -105,14 +128,36 @@ class PerformanceInterceptor extends Interceptor {
   static PerformanceSpan? span(RequestOptions options) =>
       options.extra[_key] as PerformanceSpan?;
 
+  static void headersReceived(RequestOptions options) {
+    final timing = span(options);
+    if (timing != null) options.extra[_headersKey] = timing.elapsedUs;
+  }
+
+  static void _afterHeaders(RequestOptions options) {
+    final headers = options.extra.remove(_headersKey);
+    final timing = span(options);
+    if (headers is int && timing != null) {
+      // Stream responses are handed to the caller without draining their body.
+      timing.mark(
+        options.responseType == ResponseType.stream
+            ? 'http.stream_handoff'
+            : 'http.body_and_transform',
+        {'durationUs': timing.elapsedUs - headers},
+      );
+    }
+  }
+
   @override
   void onResponse(Response response, ResponseInterceptorHandler handler) {
+    _afterHeaders(response.requestOptions);
     span(response.requestOptions)?.end(
       data: {
         'status': response.statusCode,
         'endpoint': endpoint(response.requestOptions.uri),
         'method': response.requestOptions.method,
         if (response.data is List) 'items': (response.data as List).length,
+        if (response.data is Map && response.data['Items'] is List)
+          'items': (response.data['Items'] as List).length,
       },
     );
     response.requestOptions.extra.remove(_key);
@@ -121,6 +166,7 @@ class PerformanceInterceptor extends Interceptor {
 
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
+    _afterHeaders(err.requestOptions);
     span(err.requestOptions)?.end(
       outcome: err.type.name,
       data: {

@@ -6,6 +6,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:playback_core/playback_core.dart';
 import 'package:server_core/server_core.dart' hide PackageInfo;
 
@@ -26,6 +27,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
   Timer? _sampleTimer, _heartbeat, _limit;
   Future<void>? _write;
   bool _sampling = false, _foreground = true, _busy = false;
+  bool _observersAttached = false;
   bool _storageFailed = false;
   bool recording = false, hasReport = false, showOverlay = true;
   String status = 'Record a session to investigate slow actions.';
@@ -46,6 +48,17 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
   bool _lastBuffering = false;
   PerformanceSpan? _buffering;
   Map<String, Object?>? _mediaState;
+  Map<String, Object?>? _decoderCounters;
+  PerformanceSpan? _firstPlaying, _seek;
+  PlaybackBringupPhase? _previousPhase;
+  int? _seekNativeUs, _mediaStateReceivedUs, _networkSampleUs, _networkBytes;
+  bool _seekFrameSeen = false, _seekPlayingSeen = false, _seekAudioSeen = false;
+  bool _hadFrame = false;
+  int? _seekId;
+  String _bufferingKind = 'startup';
+  int _visit = 0;
+  final Map<int, PerformanceSpan> _artworkSpans = {};
+  final Set<int> _artworkReady = {}, _artworkPainted = {};
 
   bool get busy => _busy;
   int get elapsedSeconds =>
@@ -89,6 +102,20 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       _prerollViewing = null;
       _sourceSession = null;
       _lastBuffering = false;
+      _firstPlaying = null;
+      _seek = null;
+      _seekNativeUs = null;
+      _seekId = null;
+      _previousPhase = null;
+      _decoderCounters = null;
+      _mediaStateReceivedUs = null;
+      _networkSampleUs = null;
+      _networkBytes = null;
+      _hadFrame = false;
+      _visit = 0;
+      _artworkSpans.clear();
+      _artworkReady.clear();
+      _artworkPainted.clear();
       _cpuMs = null;
       _nativeMs = null;
       _ticks = 0;
@@ -111,8 +138,6 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
         if (recording && generation == _generation) _accept(name, data);
       };
       PerformanceTrace.sink = _sink;
-      WidgetsBinding.instance.addObserver(this);
-      SchedulerBinding.instance.addTimingsCallback(_frames);
       _accept('recording.start', {
         'build': const String.fromEnvironment(
           'MOONFIN_GIT_SHA',
@@ -126,6 +151,13 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
         'screen': screen,
         'maxMinutes': 30,
       });
+      CachedNetworkImage.performanceObserver = _imageEvent;
+      await _configureNative(true);
+      if (!recording || generation != _generation) return;
+      WidgetsBinding.instance.addObserver(this);
+      SchedulerBinding.instance.addTimingsCallback(_frames);
+      _observersAttached = true;
+
       try {
         final info = await PackageInfo.fromPlatform();
         if (generation == _generation && recording) {
@@ -136,6 +168,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       } catch (_) {
         /* platform metadata unavailable in tests */
       }
+      if (!recording || generation != _generation) return;
       _lastHeartbeat = _recording!.clock.elapsedMicroseconds;
       _heartbeat = Timer.periodic(const Duration(milliseconds: 250), (_) {
         final now = _recording!.clock.elapsedMicroseconds;
@@ -169,19 +202,85 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _configureNative(bool enabled) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      await _native
+          .invokeMethod<Object?>('configure', {'enabled': enabled})
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {
+      if (recording)
+        _accept('diagnostics.native_configuration_unavailable', {});
+    }
+  }
+
   void _accept(String name, Map<String, Object?> data) {
+    if (name == 'navigation.changed') {
+      _visit++;
+      for (final span in _artworkSpans.values) {
+        span.end(outcome: 'navigation_changed');
+      }
+      _artworkSpans.clear();
+      _artworkReady.clear();
+      _artworkPainted.clear();
+    }
     _recording?.add(name, {'screen': screen, ...data});
     if (name.endsWith('.data.ready')) {
       final generation = _generation;
+      final visit = _visit;
+      final originalScreen = screen;
       final at = _recording!.clock.elapsedMicroseconds;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (recording && generation == _generation) {
+        if (recording && generation == _generation && visit == _visit) {
           _recording?.add('ui.frame_after_data', {
             'name': name,
             'durationUs': _recording!.clock.elapsedMicroseconds - at,
-            'screen': screen,
+            'screen': originalScreen,
+            'visit': visit,
+            'parent': data['parent'],
+            'row': data['row'],
           });
         }
+      });
+    }
+  }
+
+  void _imageEvent(String stage, String key, int? width, int? height) {
+    if (!recording) return;
+    final uri = Uri.tryParse(key);
+    if (uri == null || !uri.hasAuthority) return;
+    final alias = PerformanceTrace.alias(
+      'image:$_visit:${uri.origin}${uri.path}:$width:$height',
+    );
+    if (alias == 0) return;
+    if (stage == 'requested') {
+      if (_artworkSpans.containsKey(alias) ||
+          _artworkReady.contains(alias) ||
+          _artworkSpans.length >= 256 ||
+          _artworkReady.length >= 1024)
+        return;
+      final span = PerformanceTrace.begin('artwork.widget.wait', {
+        'image': alias,
+        'imageSource': PerformanceTrace.alias('image:${uri.origin}${uri.path}'),
+        'visit': _visit,
+        'decodeWidth': width,
+        'decodeHeight': height,
+      });
+      if (span != null) _artworkSpans[alias] = span;
+    } else if (stage == 'ready' || stage == 'error') {
+      final span = _artworkSpans.remove(alias);
+      if (span == null) return;
+      _artworkReady.add(alias);
+      span.end(
+        outcome: stage == 'error' ? 'error' : 'ok',
+        data: {'image': alias},
+      );
+    } else if (stage == 'painted_in_viewport' &&
+        _artworkPainted.length < 1024 &&
+        _artworkPainted.add(alias)) {
+      PerformanceTrace.event('artwork.viewport.paint', {
+        'image': alias,
+        'visit': _visit,
       });
     }
   }
@@ -191,6 +290,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     _accept('user.marker', {'marker': markerCount + 1});
     status =
         'Marked moment ${markerCount}. Keep using the app or stop to send.';
+    unawaited(_sample(detailed: true));
     unawaited(_flush());
     notifyListeners();
   }
@@ -256,7 +356,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     _frameOmitted = 0;
   }
 
-  Future<void> _sample() async {
+  Future<void> _sample({bool detailed = false}) async {
     if (!recording || _sampling) return;
     _sampling = true;
     final generation = _generation;
@@ -264,7 +364,30 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       _ticks++;
       _flushFrames();
       if (_foreground || _sourceSession != null) {
-        if (_mediaState != null) _accept('media.state', _mediaState!);
+        final state = _mediaState;
+        if (state != null) {
+          final now = _recording!.clock.elapsedMicroseconds;
+          final nativeUs = state['nativeUs'] as int?;
+          final bytes = state['networkBytes'] as int?;
+          _accept('media.state', {
+            ...state,
+            'stateAgeUs': now - (_mediaStateReceivedUs ?? now),
+            if (nativeUs != null &&
+                bytes != null &&
+                _networkBytes != null &&
+                _networkSampleUs != null &&
+                nativeUs > _networkSampleUs! &&
+                bytes >= _networkBytes!)
+              'networkBitsPerSecond':
+                  (bytes - _networkBytes!) *
+                  8000000 /
+                  (nativeUs - _networkSampleUs!),
+          });
+          _networkSampleUs = nativeUs;
+          _networkBytes = bytes;
+        }
+        if (_decoderCounters != null)
+          _accept('media.decoder.counters', _decoderCounters!);
         final cache = PaintingBinding.instance.imageCache;
         _accept('cache.images', {
           'entries': cache.currentSize,
@@ -276,7 +399,8 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
           final at = _recording!.clock.elapsedMicroseconds;
           final values = await _native
               .invokeMapMethod<String, dynamic>('sample', {
-                'memory': _ticks == 1 || _ticks % 10 == 0,
+                'memory': detailed || _ticks == 1 || _ticks % 10 == 0,
+                'reset': _ticks == 1,
               })
               .timeout(const Duration(seconds: 3));
           if (!recording || generation != _generation) return;
@@ -296,6 +420,8 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
           _accept('resources.sample', {
             ...?values,
             'cpuOneCorePercent': cpuPercent,
+            'requestAtUs': at,
+            'replyAtUs': _recording!.clock.elapsedMicroseconds,
             'bridgeRoundTripUs': _recording!.clock.elapsedMicroseconds - at,
           });
         }
@@ -316,8 +442,10 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     if (model == null) return;
     final previous = _write ?? Future<void>.value();
     final task = previous.then((_) async {
+      final cost = Stopwatch()..start();
       final batch = model.drain();
       final summary = model.summary(complete: complete);
+      final serializationUs = cost.elapsedMicroseconds;
       try {
         final fits = await _store.append(batch, summary);
         if (!fits) {
@@ -331,6 +459,13 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
         for (final _ in batch) {
           model.dropped++;
         }
+      }
+      if (recording && identical(model, _recording)) {
+        _accept('diagnostics.writer', {
+          'events': batch.length,
+          'serializationUs': serializationUs,
+          'durationUs': cost.elapsedMicroseconds,
+        });
       }
     });
     _write = task;
@@ -350,15 +485,29 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     _buffering?.end(outcome: 'recording_stopped');
     _phase?.end(outcome: 'recording_stopped');
     _mainTitle?.end(outcome: 'recording_stopped');
+    _firstPlaying?.end(outcome: 'recording_stopped');
+    _seek?.end(outcome: 'recording_stopped');
+    for (final span in _artworkSpans.values) {
+      span.end(outcome: 'recording_stopped');
+    }
+    _artworkSpans.clear();
+    if (CachedNetworkImage.performanceObserver == _imageEvent) {
+      CachedNetworkImage.performanceObserver = null;
+    }
     _prerollViewing?.end(outcome: 'recording_stopped');
     _accept('recording.stop', {'reason': reason});
     recording = false;
     if (identical(PerformanceTrace.sink, _sink)) PerformanceTrace.sink = null;
+    PerformanceTrace.resetAliases();
     _sampleTimer?.cancel();
     _heartbeat?.cancel();
     _limit?.cancel();
-    SchedulerBinding.instance.removeTimingsCallback(_frames);
-    WidgetsBinding.instance.removeObserver(this);
+    if (_observersAttached) {
+      SchedulerBinding.instance.removeTimingsCallback(_frames);
+      WidgetsBinding.instance.removeObserver(this);
+      _observersAttached = false;
+    }
+    await _configureNative(false);
     _recording?.clock.stop();
     _identities.clear();
     await _flush(complete: true);
@@ -398,14 +547,28 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     if (!recording) return null;
     _launch?.end(outcome: 'superseded');
     _mainTitle?.end(outcome: 'superseded');
+    _firstPlaying?.end(outcome: 'superseded');
     _launch = PerformanceTrace.begin('play.launch');
     _mainTitle = PerformanceTrace.begin('play.main_title_including_prerolls');
+    _firstPlaying = PerformanceTrace.begin('play.tap_to_playing');
     return _launch;
   }
 
   void bringup(PlaybackBringupState state, {bool isPreroll = false}) {
     if (!recording) return;
     _isPreroll = isPreroll;
+    final previousPhase = _previousPhase;
+    _previousPhase = state.phase;
+    // stop() emits idle while a new launch is replacing the previous player.
+    // This is an intermediate teardown, not cancellation of the new launch.
+    if (state.phase == PlaybackBringupPhase.idle &&
+        previousPhase == PlaybackBringupPhase.stoppingPrevious &&
+        _launch != null) {
+      PerformanceTrace.event('play.previous_session_stopped', {
+        'launch': _launch!.id,
+      });
+      return;
+    }
     _phase?.end();
     _phase = null;
     if (!['ready', 'idle', 'failed'].contains(state.phase.name)) {
@@ -446,6 +609,12 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       _mediaState = null;
       _mainTitle?.end(outcome: state.phase.name);
       _mainTitle = null;
+      _firstPlaying?.end(outcome: state.phase.name);
+      _firstPlaying = null;
+      _seek?.end(outcome: state.phase.name);
+      _seek = null;
+      _seekNativeUs = null;
+      _seekId = null;
       _prerollViewing?.end(outcome: state.phase.name);
       _prerollViewing = null;
     }
@@ -453,6 +622,14 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
 
   int mediaSourceOpened() {
     _sourceGeneration++;
+    _seek?.end(outcome: 'source_changed');
+    _seek = null;
+    _seekNativeUs = null;
+    _seekId = null;
+    _hadFrame = false;
+    _decoderCounters = null;
+    _networkBytes = null;
+    _networkSampleUs = null;
     _mediaState = null;
     _buffering?.end(outcome: 'source_changed');
     _buffering = null;
@@ -474,7 +651,17 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
         generation != _sourceGeneration)
       return;
     if (event == 'state') {
+      if (map['isBuffering'] == true && !_lastBuffering) {
+        _bufferingKind = _seek != null
+            ? 'seek'
+            : !_hadFrame
+            ? 'startup'
+            : map['playWhenReady'] == false
+            ? 'paused'
+            : 'rebuffer';
+      }
       buffering(map['isBuffering'] == true);
+      _mediaStateReceivedUs = _recording!.clock.elapsedMicroseconds;
       _mediaState = {
         'generation': generation,
         for (final key in [
@@ -485,6 +672,32 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
           'isBuffering',
           'performanceBytes',
           'performanceLoads',
+          'networkBytes',
+          'activeTransfers',
+          'endedTransfers',
+          'omittedTransfers',
+          'lastByteAgeUs',
+          'firstByteNativeUs',
+          'bufferAheadMs',
+          'playWhenReady',
+          'playbackStateCode',
+          'suppressionReason',
+          'isLoading',
+          'seekable',
+          'live',
+        ])
+          if (map.containsKey(key)) key: map[key],
+      };
+      return;
+    }
+    if (event == 'decoder.counters') {
+      _decoderCounters = {
+        for (final key in [
+          'nativeUs',
+          'rendered',
+          'dropped',
+          'skipped',
+          'maxConsecutiveDropped',
         ])
           if (map.containsKey(key)) key: map[key],
       };
@@ -500,7 +713,26 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
       'performanceFormat',
       'performanceLoadStart',
       'performanceLoadError',
+      'performanceLoadCanceled',
       'performanceMarker',
+      'position.discontinuity',
+      'position.advancing',
+      'seek.command',
+      'playback.state',
+      'playing.changed',
+      'play_intent',
+      'player.error',
+      'audio.advancing',
+      'source.config',
+      'prepare.returned',
+      'player.created',
+      'audio.track_initialized',
+      'audio.track_released',
+      'bandwidth.estimate',
+      'transfer.open',
+      'transfer.headers',
+      'transfer.first_byte',
+      'transfer.end',
     };
     if (!names.contains(event)) return;
     PerformanceTrace.event('media.$event', {
@@ -521,16 +753,81 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
         'performanceBytes',
         'loadId',
         'kind',
+        'caller',
         'width',
         'height',
         'bitrate',
         'frameRate',
         'codec',
         'outcome',
+        'transfer',
+        'rangeStart',
+        'requestedBytes',
+        'durationUs',
+        'status',
+        'stateCode',
+        'reasonCode',
+        'errorCode',
+        'fromMs',
+        'targetMs',
+        'seek',
+        'adjustment',
+        'playWhenReady',
+        'isPlaying',
+        'suppressionReason',
+        'internalRecovery',
+        'resumeMs',
+        'heapLimitBytes',
+        'playerCreateUs',
+        'targetBufferBytes',
+        'minBufferMs',
+        'maxBufferMs',
+        'startBufferMs',
+        'rebufferMs',
+        'lowRam',
+        'sampleRate',
+        'channels',
+        'encoding',
+        'offload',
+        'bufferBytes',
+        'bitrateEstimate',
       ])
         if (map.containsKey(key)) key: map[key],
     });
+    if (event == 'position.discontinuity' && map['seek'] == true) {
+      _seek?.end(outcome: 'superseded');
+      _seekNativeUs = map['nativeUs'] as int?;
+      _seekFrameSeen = false;
+      _seekPlayingSeen = false;
+      _seekAudioSeen = false;
+      _seek = PerformanceTrace.begin('play.seek', {
+        'fromMs': map['fromMs'],
+        'targetMs': map['targetMs'],
+        'generation': generation,
+        'nativeUs': _seekNativeUs,
+      });
+      _seekId = _seek?.id;
+    }
+    if (event == 'playing.changed' && map['isPlaying'] == true) {
+      _firstPlaying?.end(data: {'backend': 'media3', 'generation': generation});
+      _firstPlaying = null;
+      if (!_seekPlayingSeen) _seekCheckpoint('playing', map);
+      _seekPlayingSeen = true;
+      _seek?.end();
+      _seek = null;
+    }
+    if (event == 'audio.advancing' && !_seekAudioSeen) {
+      _seekCheckpoint('audio_advancing', map);
+      _seekAudioSeen = true;
+    }
+    if (event == 'position.advancing')
+      _seekCheckpoint('position_advancing', map);
     if (event == 'firstFrameRendered') {
+      _hadFrame = true;
+      if (!_seekFrameSeen) {
+        _seekCheckpoint('first_frame', map);
+        _seekFrameSeen = true;
+      }
       _launch?.end(data: {'backend': 'media3', 'generation': generation});
       _launch = null;
       _source?.end(data: {'backend': 'media3', 'generation': generation});
@@ -546,15 +843,31 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     if (event == 'performanceMarker') marker();
   }
 
+  void _seekCheckpoint(String stage, Map<dynamic, dynamic> map) {
+    final nativeUs = map['nativeUs'];
+    if (_seekId == null ||
+        _seekNativeUs == null ||
+        nativeUs is! int ||
+        nativeUs < _seekNativeUs!)
+      return;
+    PerformanceTrace.event('media.seek.$stage', {
+      'span': _seekId,
+      'generation': _sourceGeneration,
+      'durationUs': nativeUs - _seekNativeUs!,
+      'nativeUs': nativeUs,
+    });
+  }
+
   void buffering(bool value) {
     if (!recording || value == _lastBuffering) return;
     _lastBuffering = value;
     if (value)
       _buffering = PerformanceTrace.begin('media.buffering', {
         'generation': _sourceGeneration,
+        'kind': _bufferingKind,
       });
     else {
-      _buffering?.end();
+      _buffering?.end(data: {'kind': _bufferingKind});
       _buffering = null;
     }
   }

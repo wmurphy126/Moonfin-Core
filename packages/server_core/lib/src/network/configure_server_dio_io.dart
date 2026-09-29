@@ -148,6 +148,7 @@ class _SlotLimitedAdapter implements HttpClientAdapter {
     });
     try {
       final body = await _inner.fetch(options, requestStream, cancelFuture);
+      PerformanceInterceptor.headersReceived(options);
       timing?.mark('http.headers', {
         'status': body.statusCode,
         'durationUs': timing.elapsedUs - dispatchedAt!,

@@ -27,12 +27,27 @@ class PerformanceTrace {
 
   static int alias(String value) {
     if (_aliases.containsKey(value)) return _aliases[value]!;
-    if (_aliases.length >= 256) return 0;
+    if (_aliases.length >= 4096) return 0;
     return _aliases[value] = _aliases.length + 1;
   }
 
   static int get current => Zone.current[_contextKey] as int? ?? 0;
   static bool get enabled => sink != null;
+
+  /// Describes an identifier's namespace without putting the identifier in a log.
+  static String identifierKind(String? value) {
+    if (value == null || value.isEmpty) return 'missing';
+    if (value.startsWith('tmdb:')) return 'tmdb_synthetic';
+    if (RegExp(r'^[a-fA-F0-9-]{32,36}$').hasMatch(value)) return 'server_guid';
+    return 'other';
+  }
+
+  static Future<T> within<T>(
+    PerformanceSpan? span,
+    Future<T> Function() body,
+  ) => span == null
+      ? body()
+      : runZoned(body, zoneValues: {_contextKey: span.id});
 
   static void event(String name, [Map<String, Object?> data = const {}]) {
     final target = sink;

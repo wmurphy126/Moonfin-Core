@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:server_core/server_core.dart';
 
 import '../../preference/preference_constants.dart';
 import '../../preference/seerr_preferences.dart';
@@ -126,14 +127,19 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
     SeerrStudio(id: 41077, name: 'A24', logoPath: 'https://image.tmdb.org/t/p/w780_filter(duotone,ffffff,bababa)/1ZXsGaFPgrgS6ZZGS37AqD5uU12.png'),
   ];
 
-  Future<void> load() async {
+  Future<void> load() =>
+      PerformanceTrace.measure('seerr.discover.load', _loadRecorded);
+
+  Future<void> _loadRecorded() async {
+    PerformanceTrace.observed(this, 'discover');
     if (_isLoading) return;
     _isLoading = true;
     _error = null;
     notifyListeners();
 
     try {
-      await _repo.ensureInitialized(force: true);
+      await PerformanceTrace.measure('seerr.initialize',
+          () => _repo.ensureInitialized(force: true));
       if (!_repo.isAvailable) {
         _isLoading = false;
         _error = _repo.serverReportsEnabled
@@ -250,7 +256,12 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
     await mapBounded<int, void>(indices, 2, (index) => _loadRow(index));
   }
 
-  Future<void> _loadRow(int index) async {
+  Future<void> _loadRow(int index) => PerformanceTrace.measure(
+    'seerr.row.load', () => _loadRowRecorded(index),
+    data: {'row': _rows[index].type.name, 'rowIndex': index},
+  );
+
+  Future<void> _loadRowRecorded(int index) async {
     final row = _rows[index];
     try {
       switch (row.type) {
@@ -291,6 +302,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
           }
       }
     } catch (e) {
+      PerformanceTrace.event('seerr.row.error', {'row': row.type.name, 'kind': e.runtimeType.toString()});
       debugPrint('[SeerrDiscover] Failed to load row ${row.type}: $e');
       _updateRow(index, row.copyWith(isLoading: false));
     }
@@ -307,6 +319,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
       final items = _filterItems(page.results)..shuffle();
       _updateRow(index, row.copyWith(items: items, isLoading: false));
     } catch (_) {
+      PerformanceTrace.event('seerr.row.error', {'row': row.type.name});
       _updateRow(index, row.copyWith(isLoading: false));
     }
   }
@@ -323,6 +336,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
         isLoading: false,
       ));
     } catch (_) {
+      PerformanceTrace.event('seerr.row.error', {'row': row.type.name});
       _updateRow(index, row.copyWith(isLoading: false));
     }
   }
@@ -334,6 +348,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
       final items = await Future.wait(media.map(_mediaToDiscoverItem));
       _updateRow(index, row.copyWith(items: items, isLoading: false));
     } catch (_) {
+      PerformanceTrace.event('seerr.row.error', {'row': row.type.name});
       _updateRow(index, row.copyWith(isLoading: false));
     }
   }
@@ -392,12 +407,17 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
 
       _updateRow(index, row.copyWith(items: items, isLoading: false));
     } catch (e) {
+      PerformanceTrace.event('seerr.row.error', {'row': row.type.name, 'kind': e.runtimeType.toString()});
       debugPrint('[SeerrDiscover] Failed to load requests: $e');
       _updateRow(index, row.copyWith(isLoading: false));
     }
   }
 
-  Future<SeerrDiscoverItem> _enrichRequestItem(SeerrDiscoverItem item) async {
+  Future<SeerrDiscoverItem> _enrichRequestItem(SeerrDiscoverItem item) =>
+      PerformanceTrace.measure('seerr.item.enrich', () => _enrichRequestItemRecorded(item),
+        data: {'needed': item.backdropPath == null || item.voteAverage == null});
+
+  Future<SeerrDiscoverItem> _enrichRequestItemRecorded(SeerrDiscoverItem item) async {
     if (item.backdropPath != null && item.voteAverage != null) {
       return item;
     }
@@ -458,6 +478,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
         department: item.department,
       );
     } catch (_) {
+      PerformanceTrace.event('seerr.item.enrichment_fallback');
       return item;
     }
   }
@@ -470,6 +491,7 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
           : await _repo.getGenreSliderTv();
       _updateRow(index, row.copyWith(genres: genres, isLoading: false));
     } catch (e) {
+      PerformanceTrace.event('seerr.row.error', {'row': row.type.name, 'kind': e.runtimeType.toString()});
       debugPrint('[SeerrDiscover] Failed to load genres: $e');
       _updateRow(index, row.copyWith(isLoading: false));
     }
@@ -516,9 +538,22 @@ class SeerrDiscoverViewModel extends ChangeNotifier {
     return nsfwPatterns.any((p) => p.hasMatch(text));
   }
 
+  bool _diagnosticDisposed = false;
+
+  @override
+  void dispose() {
+    _diagnosticDisposed = true;
+    PerformanceTrace.disposed(this, 'discover');
+    super.dispose();
+  }
+
   void _updateRow(int index, SeerrDiscoverRow row) {
     _rows = List.of(_rows);
     _rows[index] = row;
+    PerformanceTrace.event('seerr.row.data.ready', {
+      'row': row.type.name, 'rowIndex': index, 'items': row.items.length,
+      'loading': row.isLoading, 'disposed': _diagnosticDisposed,
+    });
     notifyListeners();
   }
 

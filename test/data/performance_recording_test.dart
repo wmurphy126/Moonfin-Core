@@ -186,6 +186,89 @@ void main() {
   });
 
   test(
+    'synthetic episode requests retain caller and anonymous repeat identity',
+    () async {
+      final recording = PerformanceRecording();
+      PerformanceTrace.sink = recording.add;
+      final dio = Dio()..httpClientAdapter = _Adapter();
+      dio.interceptors.add(PerformanceInterceptor());
+      for (final token in ['first-secret', 'rotated-secret']) {
+        final parent = PerformanceTrace.begin('details.episodes', {
+          'caller': 'modern_build',
+          'idKind': 'tmdb_synthetic',
+          'seerrOnly': true,
+        });
+        await PerformanceTrace.within(
+          parent,
+          () => dio.get(
+            'https://private.example/Shows/tmdb:tv:32868/Episodes',
+            queryParameters: {'api_key': token, 'Fields': 'Overview'},
+          ),
+        );
+        parent!.end(outcome: 'api_error');
+      }
+      final lines = recording.drain();
+      final rows = lines
+          .map((line) => jsonDecode(line) as Map<String, dynamic>)
+          .toList();
+      final parents = rows
+          .where(
+            (e) =>
+                e['event'] == 'span.begin' && e['name'] == 'details.episodes',
+          )
+          .toList();
+      final requests = rows
+          .where(
+            (e) => e['event'] == 'span.begin' && e['name'] == 'http.request',
+          )
+          .toList();
+      expect(requests.map((e) => e['parent']), parents.map((e) => e['id']));
+      expect(requests.map((e) => e['idKind']), everyElement('tmdb_synthetic'));
+      expect(requests.map((e) => e['requestAlias']).toSet(), hasLength(1));
+      final completed = rows.where(
+        (e) => e['event'] == 'span.end' && e['name'] == 'details.episodes',
+      );
+      expect(completed.map((e) => e['caller']), everyElement('modern_build'));
+      expect(
+        recording.summary(complete: true),
+        contains('details.episodes [api_error]'),
+      );
+      for (final secret in [
+        'private.example',
+        '32868',
+        'first-secret',
+        'rotated-secret',
+      ]) {
+        expect(lines.join(), isNot(contains(secret)));
+      }
+      dio.close();
+    },
+  );
+
+  test(
+    'failed operations do not contaminate successful duration summaries',
+    () {
+      final data = PerformanceRecording();
+      data.add('span.end', {
+        'id': 1,
+        'name': 'play.launch',
+        'outcome': 'idle',
+        'durationUs': 100,
+      });
+      data.add('span.end', {
+        'id': 2,
+        'name': 'play.launch',
+        'outcome': 'ok',
+        'durationUs': 4000000,
+      });
+      final report = data.summary(complete: true);
+      expect(report, contains('play.launch [idle]: n=1'));
+      expect(report, contains('play.launch: n=1'));
+      expect(report, contains('max=4000.0'));
+    },
+  );
+
+  test(
     'concurrent progress requests are visible separately from other APIs',
     () {
       final data = PerformanceRecording();

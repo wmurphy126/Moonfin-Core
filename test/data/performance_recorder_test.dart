@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -8,6 +9,15 @@ import 'package:moonfin/data/services/performance_recorder.dart';
 import 'package:moonfin/data/services/performance_store.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:server_core/server_core.dart' hide PackageInfo;
+import 'package:playback_core/playback_core.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+
+List<Map<String, dynamic>> events(String report) => report
+    .substring(report.indexOf('EVENTS JSONL'))
+    .split('\n')
+    .where((line) => line.startsWith('{'))
+    .map((line) => jsonDecode(line) as Map<String, dynamic>)
+    .toList();
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -100,7 +110,8 @@ void main() {
     final reply = Completer<Map<String, Object?>>();
     final requested = Completer<void>();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(channel, (_) {
+        .setMockMethodCallHandler(channel, (call) async {
+          if (call.method != 'sample') return null;
           requested.complete();
           return reply.future;
         });
@@ -112,6 +123,201 @@ void main() {
     expect(recorder.recording, isFalse);
     expect((await recorder.report())!, isNot(contains('999999')));
     expect(PerformanceTrace.enabled, isFalse);
+  });
+
+  test(
+    'old-player cleanup cannot finish launch before first picture',
+    () async {
+      await recorder.start();
+      recorder.playTapped();
+      recorder.bringup(
+        const PlaybackBringupState(
+          phase: PlaybackBringupPhase.stoppingPrevious,
+        ),
+      );
+      recorder.bringup(const PlaybackBringupState.idle());
+      recorder.bringup(
+        const PlaybackBringupState(
+          phase: PlaybackBringupPhase.resolving,
+          sessionToken: 1,
+        ),
+      );
+      final generation = recorder.mediaSourceOpened();
+      recorder.mediaEvent('firstFrameRendered', {
+        'diagnosticGeneration': generation,
+        'nativeUs': 100,
+      });
+      recorder.mediaEvent('playing.changed', {
+        'diagnosticGeneration': generation,
+        'nativeUs': 200,
+        'isPlaying': true,
+      });
+      final rows = events((await recorder.report())!);
+      final launch = rows.singleWhere(
+        (e) => e['event'] == 'span.end' && e['name'] == 'play.launch',
+      );
+      expect(launch['outcome'], 'ok');
+      expect(
+        rows.any((e) => e['event'] == 'play.previous_session_stopped'),
+        isTrue,
+      );
+      expect(
+        rows.singleWhere(
+          (e) => e['event'] == 'span.end' && e['name'] == 'play.tap_to_playing',
+        )['outcome'],
+        'ok',
+      );
+    },
+  );
+
+  test('seek milestones use native time in either callback order', () async {
+    await recorder.start();
+    final generation = recorder.mediaSourceOpened();
+    void send(String name, int time, [Map<String, Object?> data = const {}]) =>
+        recorder.mediaEvent(name, {
+          'diagnosticGeneration': generation,
+          'nativeUs': time,
+          ...data,
+        });
+    send('position.discontinuity', 1000, {'seek': true, 'targetMs': 60000});
+    send('playing.changed', 1500, {'isPlaying': true});
+    send('firstFrameRendered', 1900);
+    send(
+      'firstFrameRendered',
+      2000,
+    ); // Duplicate callback must not inflate totals.
+    send('position.discontinuity', 10000, {'seek': true, 'targetMs': 90000});
+    send('firstFrameRendered', 11000);
+    send('audio.advancing', 11500);
+    send('playing.changed', 12000, {'isPlaying': true});
+    final rows = events((await recorder.report())!);
+    expect(
+      rows
+          .where((e) => e['event'] == 'media.seek.first_frame')
+          .map((e) => e['durationUs']),
+      [900, 1000],
+    );
+    expect(
+      rows
+          .where((e) => e['event'] == 'media.seek.playing')
+          .map((e) => e['durationUs']),
+      [500, 2000],
+    );
+    expect(
+      rows.singleWhere(
+        (e) => e['event'] == 'media.seek.audio_advancing',
+      )['durationUs'],
+      1500,
+    );
+  });
+
+  test(
+    'rapid and paused seeks retain incomplete outcomes separately',
+    () async {
+      await recorder.start();
+      final generation = recorder.mediaSourceOpened();
+      for (final time in [1000, 2000]) {
+        recorder.mediaEvent('position.discontinuity', {
+          'diagnosticGeneration': generation,
+          'nativeUs': time,
+          'seek': true,
+        });
+      }
+      recorder.mediaEvent('state', {
+        'diagnosticGeneration': generation,
+        'nativeUs': 2100,
+        'isBuffering': true,
+        'playWhenReady': false,
+      });
+      recorder.mediaEvent('firstFrameRendered', {
+        'diagnosticGeneration': generation,
+        'nativeUs': 3000,
+      });
+      recorder.mediaEvent('state', {
+        'diagnosticGeneration': generation,
+        'nativeUs': 3100,
+        'isBuffering': false,
+        'playWhenReady': false,
+      });
+      final rows = events((await recorder.report())!);
+      expect(
+        rows
+            .where((e) => e['event'] == 'span.end' && e['name'] == 'play.seek')
+            .map((e) => e['outcome']),
+        ['superseded', 'recording_stopped'],
+      );
+      expect(
+        rows.singleWhere(
+          (e) => e['event'] == 'media.seek.first_frame',
+        )['durationUs'],
+        1000,
+      );
+      expect(
+        rows.singleWhere(
+          (e) => e['event'] == 'span.end' && e['name'] == 'media.buffering',
+        )['kind'],
+        'seek',
+      );
+      expect(rows.any((e) => e['event'] == 'media.seek.playing'), isFalse);
+    },
+  );
+
+  test(
+    'stop during native configuration cannot reattach recorder hooks',
+    () async {
+      final configured = Completer<void>();
+      final reply = Completer<void>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'configure' &&
+                call.arguments['enabled'] == true) {
+              configured.complete();
+              await reply.future;
+            }
+            return null;
+          });
+      final starting = recorder.start();
+      await configured.future;
+      await recorder.stop();
+      reply.complete();
+      await starting;
+      expect(recorder.recording, isFalse);
+      expect(PerformanceTrace.enabled, isFalse);
+      expect(CachedNetworkImage.performanceObserver, isNull);
+    },
+  );
+
+  test('artwork repeats deduplicate within a visit and detach on stop', () async {
+    await recorder.start();
+    void image(String phase) => CachedNetworkImage.performanceObserver!(
+      phase,
+      'https://private.example/Items/private-id/Images/Primary?api_key=secret',
+      320,
+      null,
+    );
+    image('requested');
+    image('requested');
+    image('ready');
+    image('painted_in_viewport');
+    image('painted_in_viewport');
+    PerformanceTrace.event('navigation.changed');
+    image('requested');
+    final report = (await recorder.report())!;
+    final rows = events(report);
+    expect(
+      rows.where(
+        (e) => e['event'] == 'span.begin' && e['name'] == 'artwork.widget.wait',
+      ),
+      hasLength(2),
+    );
+    expect(
+      rows.where((e) => e['event'] == 'artwork.viewport.paint'),
+      hasLength(1),
+    );
+    expect(report, isNot(contains('private.example')));
+    expect(report, isNot(contains('private-id')));
+    expect(report, isNot(contains('secret')));
+    expect(CachedNetworkImage.performanceObserver, isNull);
   });
 
   test(

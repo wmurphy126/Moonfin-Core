@@ -55,6 +55,10 @@ import androidx.media3.common.util.TimestampAdjuster
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.decoder.av1.Dav1dLibrary
 import androidx.media3.decoder.av1.Libdav1dVideoRenderer
@@ -988,7 +992,40 @@ class Media3VideoView(
     private var playerCreatedAtMs = 0L
     private val audioClockListener: (Long) -> Unit = { maybeRecoverAudioClock(it) }
     private var isPlayerReleased = false
+    private fun diagnosticEvent(name: String, data: Map<String, Any?> = emptyMap()) {
+        if (diagnosticGeneration == 0 || !MediaTransferMetrics.recordingEnabled) return
+        Media3Bridge.emitEvent(mapOf("event" to name,
+            "diagnosticGeneration" to diagnosticGeneration,
+            "nativeUs" to SystemClock.elapsedRealtimeNanos() / 1000) + data)
+    }
+    private val transferMetrics = MediaTransferMetrics(
+        { SystemClock.elapsedRealtimeNanos() / 1000 }, { Media3Bridge.emitEvent(it) })
+    private val measuredTransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, spec: DataSpec, network: Boolean) {
+            Media3TransferLog.onTransferInitializing(source, spec, network)
+            if (network && MediaTransferMetrics.recordingEnabled) transferMetrics.initializing(source, spec.position, spec.length)
+        }
+        override fun onTransferStart(source: DataSource, spec: DataSpec, network: Boolean) {
+            Media3TransferLog.onTransferStart(source, spec, network)
+            if (network && MediaTransferMetrics.recordingEnabled) transferMetrics.started(source, (source as? HttpDataSource)?.responseCode)
+        }
+        override fun onBytesTransferred(source: DataSource, spec: DataSpec, network: Boolean, bytes: Int) {
+            Media3TransferLog.onBytesTransferred(source, spec, network, bytes)
+            if (network && MediaTransferMetrics.recordingEnabled) transferMetrics.bytes(source, bytes)
+        }
+        override fun onTransferEnd(source: DataSource, spec: DataSpec, network: Boolean) {
+            Media3TransferLog.onTransferEnd(source, spec, network)
+            if (network) transferMetrics.ended(source)
+        }
+    }
     private var diagnosticGeneration = 0
+    private var diagnosticCountersAtMs = 0L
+    private var lastPlayerCreateUs = 0L
+    private var diagnosticMotionOriginMs = 0L
+    private var diagnosticMotionAtUs = 0L
+    private var diagnosticMotionPending = false
+    private var diagnosticSeekCaller = "internal_or_player"
+    private var diagnosticLoadControl: Map<String, Any?> = emptyMap()
     private var performanceLoads = 0
     private var performanceBytes = 0L
     private var diagnosticOverlay = false
@@ -1102,6 +1139,8 @@ class Media3VideoView(
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            diagnosticEvent("playback.state", mapOf("stateCode" to playbackState,
+                "positionMs" to player.currentPosition, "playWhenReady" to player.playWhenReady))
             if (
                 playbackState == Player.STATE_READY &&
                 !firstFrameRendered &&
@@ -1131,10 +1170,16 @@ class Media3VideoView(
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
+            diagnosticEvent("playing.changed", mapOf("isPlaying" to isPlaying,
+                "positionMs" to player.currentPosition,
+                "playWhenReady" to player.playWhenReady,
+                "suppressionReason" to player.playbackSuppressionReason))
             emitState()
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            diagnosticEvent("play_intent", mapOf("playWhenReady" to playWhenReady,
+                "reasonCode" to reason, "internalRecovery" to suppressStateEmissionsForRekick))
             // The HDMI switch drops the audio route and the player pauses
             // itself. A pause the user asked for has to survive the switch, so
             // only the system's own is worth undoing.
@@ -1174,6 +1219,7 @@ class Media3VideoView(
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            diagnosticEvent("player.error", mapOf("errorCode" to error.errorCode))
             // Recovery order matters: an error while a display mode switch is
             // in flight is most likely the dropped surface, so that retry gets
             // the first look. A reclaimed decoder is next, since nothing else
@@ -1293,6 +1339,18 @@ class Media3VideoView(
             newPosition: Player.PositionInfo,
             reason: Int,
         ) {
+            if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                diagnosticMotionOriginMs = newPosition.positionMs
+                diagnosticMotionAtUs = SystemClock.elapsedRealtimeNanos() / 1000
+                diagnosticMotionPending = true
+            }
+            diagnosticEvent("position.discontinuity", mapOf(
+                "caller" to diagnosticSeekCaller,
+                "reasonCode" to reason, "fromMs" to oldPosition.positionMs,
+                "targetMs" to newPosition.positionMs,
+                "seek" to (reason == Player.DISCONTINUITY_REASON_SEEK),
+                "adjustment" to (reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT)))
+            diagnosticSeekCaller = "internal_or_player"
             if (reason == Player.DISCONTINUITY_REASON_SEEK ||
                 reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
             ) {
@@ -1329,6 +1387,21 @@ class Media3VideoView(
     }
 
     private val analyticsListener = object : AnalyticsListener {
+        override fun onAudioPositionAdvancing(eventTime: AnalyticsListener.EventTime,
+            playoutStartSystemTimeMs: Long) {
+            // Callback receipt uses the monotonic clock. The supplied playout
+            // timestamp uses wall time and must not be subtracted from it.
+            diagnosticEvent("audio.advancing", mapOf("positionMs" to player.currentPosition))
+        }
+
+        override fun onLoadCanceled(eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo, mediaLoadData: MediaLoadData) {
+            diagnosticEvent("performanceLoadCanceled", mapOf(
+                "loadId" to loadEventInfo.loadTaskId,
+                "durationMs" to loadEventInfo.loadDurationMs,
+                "bytes" to loadEventInfo.bytesLoaded, "outcome" to "canceled"))
+        }
+
         override fun onLoadStarted(eventTime: AnalyticsListener.EventTime,
             loadEventInfo: LoadEventInfo, mediaLoadData: MediaLoadData) {
             if (diagnosticGeneration == 0 || performanceLoads >= 5) return
@@ -1514,6 +1587,12 @@ class Media3VideoView(
             eventTime: AnalyticsListener.EventTime,
             audioTrackConfig: AudioSink.AudioTrackConfig,
         ) {
+            diagnosticEvent("audio.track_initialized", mapOf(
+                "encoding" to audioTrackConfig.encoding,
+                "sampleRate" to audioTrackConfig.sampleRate,
+                "channels" to Integer.bitCount(audioTrackConfig.channelConfig),
+                "offload" to audioTrackConfig.offload,
+                "bufferBytes" to audioTrackConfig.bufferSize))
             // Ground truth for whether bitstreaming engaged: a non-PCM
             // encoding on the AudioTrack is passthrough by definition. Under
             // the IEC packer the reported encoding is the media truth (ac3,
@@ -1742,6 +1821,12 @@ class Media3VideoView(
                 "lowRam" to isLowRamDevice,
             ),
         )
+        diagnosticLoadControl = mapOf(
+            "targetBufferBytes" to targetBufferBytes,
+            "minBufferMs" to DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+            "maxBufferMs" to if (isLowRamDevice) DefaultLoadControl.DEFAULT_MAX_BUFFER_MS else STREAMING_MAX_BUFFER_MS,
+            "startBufferMs" to DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+            "rebufferMs" to DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS)
         return builder.build()
     }
 
@@ -1939,6 +2024,7 @@ class Media3VideoView(
     }
 
     private fun createPlayer(): ExoPlayer {
+        val diagnosticStartNs = SystemClock.elapsedRealtimeNanos()
         Media3LogRelay.install()
         audioAttributeState.reset()
         cancelPendingRetime()
@@ -1989,7 +2075,7 @@ class Media3VideoView(
             .setConnectTimeoutMs(120_000)
             .setReadTimeoutMs(120_000)
         bootDataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
-            .setTransferListener(Media3TransferLog)
+            .setTransferListener(measuredTransferListener)
         val assHandler = AssHandler(
             AssRenderType.OVERLAY_CANVAS,
             AssHandlerConfig(cacheSize = assCacheSizeMb()),
@@ -2018,7 +2104,7 @@ class Media3VideoView(
             setSubtitleParserFactory(assParserFactory)
         }
 
-        return ExoPlayer.Builder(context, renderersFactory.withAssSupport(assHandler))
+        val created = ExoPlayer.Builder(context, renderersFactory.withAssSupport(assHandler))
             .setTrackSelector(trackSelector)
             .setLoadControl(buildLoadControl())
             .setMediaSourceFactory(bootMediaSourceFactory)
@@ -2046,6 +2132,9 @@ class Media3VideoView(
                 // The MediaSession attaches lazily in setSource() so muted
                 // previews never create one.
             }
+        lastPlayerCreateUs = (SystemClock.elapsedRealtimeNanos() - diagnosticStartNs) / 1000
+        diagnosticEvent("player.created", mapOf("durationUs" to lastPlayerCreateUs))
+        return created
     }
 
     private fun registerAssFonts(assHandler: AssHandler) {
@@ -2264,6 +2353,8 @@ class Media3VideoView(
                         is Map<*, *> -> (args["positionMs"] as? Number)?.toLong() ?: 0L
                         else -> 0L
                     }
+                    diagnosticSeekCaller = "platform_command"
+                    diagnosticEvent("seek.command", mapOf("targetMs" to positionMs))
                     player.seekTo(positionMs)
                     emitState()
                     result.success(null)
@@ -2454,6 +2545,8 @@ class Media3VideoView(
                         is Map<*, *> -> (args["positionMs"] as? Number)?.toLong() ?: 0L
                         else -> 0L
                     }
+                    diagnosticSeekCaller = "platform_command"
+                    diagnosticEvent("seek.command", mapOf("targetMs" to positionMs))
                     player.seekTo(positionMs)
                     emitState()
                 }
@@ -2565,11 +2658,21 @@ class Media3VideoView(
         val args = arguments as? Map<*, *> ?: return
         lastSourceArguments = args
         diagnosticGeneration = (args["diagnosticGeneration"] as? Number)?.toInt() ?: 0
+        transferMetrics.reset(diagnosticGeneration)
+        diagnosticCountersAtMs = 0L
+        diagnosticEvent("source.config", mapOf(
+            "resumeMs" to ((args["startPositionMs"] as? Number)?.toLong() ?: 0L),
+            "lowRam" to isLowRamDevice,
+            "playerCreateUs" to lastPlayerCreateUs,
+            "heapLimitBytes" to Runtime.getRuntime().maxMemory()) + diagnosticLoadControl)
         diagnosticOverlay = args["diagnosticOverlay"] == true
         performanceLoads = 0
         performanceBytes = 0L
         val url = args["url"]?.toString() ?: return
         val startPositionMs = (args["startPositionMs"] as? Number)?.toLong() ?: 0L
+        diagnosticMotionOriginMs = startPositionMs
+        diagnosticMotionAtUs = SystemClock.elapsedRealtimeNanos() / 1000
+        diagnosticMotionPending = true
         val autoPlay = args["autoPlay"] as? Boolean ?: false
         displayModeSwitchRetriesForCurrentSource = 0
         decoderReclaimRetriesForCurrentSource = 0
@@ -3985,6 +4088,7 @@ class Media3VideoView(
      */
     private fun prepareCurrentSource(startPositionMs: Long, playWhenReady: Boolean) {
         val url = currentUrl ?: return
+        val diagnosticStartNs = SystemClock.elapsedRealtimeNanos()
         cancelPendingRetime()
 
         val mediaItemBuilder = MediaItem.Builder()
@@ -4015,6 +4119,9 @@ class Media3VideoView(
             }
         }
         player.prepare()
+        diagnosticEvent("prepare.returned", mapOf(
+            "durationUs" to (SystemClock.elapsedRealtimeNanos() - diagnosticStartNs) / 1000,
+            "resumeMs" to startPositionMs, "playWhenReady" to playWhenReady))
         if (playWhenReady) {
             player.playWhenReady = true
             player.play()
@@ -5182,7 +5289,13 @@ class Media3VideoView(
         val duration = player.duration
         val bufferedPosition = player.bufferedPosition
         val videoSize = player.videoSize
-        return mapOf(
+        return transferMetrics.snapshot() + mapOf(
+            "playbackStateCode" to player.playbackState,
+            "suppressionReason" to player.playbackSuppressionReason,
+            "isLoading" to player.isLoading,
+            "seekable" to player.isCurrentMediaItemSeekable,
+            "live" to player.isCurrentMediaItemLive,
+            "bufferAheadMs" to player.totalBufferedDuration,
             "diagnosticGeneration" to diagnosticGeneration,
             "diagnosticOverlay" to (diagnosticOverlay && diagnosticGeneration != 0),
             "nativeUs" to SystemClock.elapsedRealtimeNanos() / 1000,
@@ -5216,6 +5329,26 @@ class Media3VideoView(
         // One global event stream feeds Dart, so a view that doesn't hold the
         // slot would overwrite the real player's state with its own.
         if (!Media3Bridge.isActive(this)) return
+        if (diagnosticMotionPending && diagnosticGeneration != 0 &&
+            MediaTransferMetrics.recordingEnabled && player.isPlaying &&
+            player.currentPosition >= diagnosticMotionOriginMs + 50) {
+            diagnosticMotionPending = false
+            diagnosticEvent("position.advancing", mapOf(
+                "positionMs" to player.currentPosition,
+                "durationUs" to SystemClock.elapsedRealtimeNanos() / 1000 - diagnosticMotionAtUs))
+        }
+        val diagnosticNowMs = SystemClock.elapsedRealtime()
+        if (diagnosticGeneration != 0 && MediaTransferMetrics.recordingEnabled &&
+            diagnosticNowMs - diagnosticCountersAtMs >= 1000) {
+            diagnosticCountersAtMs = diagnosticNowMs
+            val counters = player.videoDecoderCounters
+            counters?.ensureUpdated()
+            diagnosticEvent("decoder.counters", mapOf(
+                "rendered" to counters?.renderedOutputBufferCount,
+                "dropped" to counters?.droppedBufferCount,
+                "skipped" to counters?.skippedOutputBufferCount,
+                "maxConsecutiveDropped" to counters?.maxConsecutiveDroppedBufferCount))
+        }
         Media3Bridge.emitEvent(stateMap() + ("event" to "state"))
     }
 

@@ -1026,12 +1026,26 @@ class ItemDetailViewModel extends ChangeNotifier {
   /// Loads every episode of the current Series (all seasons) on demand. Used by
   /// the Modern and Nouveau detail layout's Episodes tab, accurate season counts,
   /// and the Spotlight More Episodes modal. No-op once already loaded.
-  Future<void> loadAllSeriesEpisodes() async {
+  int _episodeDiagnosticAttempt = 0;
+
+  Future<void> loadAllSeriesEpisodes({String caller = 'unspecified'}) async {
+    final trace = PerformanceTrace.begin('details.episodes', {
+      'caller': caller,
+      'resource': PerformanceTrace.resource(this),
+      'idKind': PerformanceTrace.identifierKind(itemId),
+      'seerrOnly': _isSeerrOnly,
+      'alreadyRequested': _seriesEpisodesRequested,
+      'attempt': PerformanceTrace.enabled ? ++_episodeDiagnosticAttempt : 0,
+    });
+    return PerformanceTrace.within(trace, () => _loadAllSeriesEpisodesRecorded(trace));
+  }
+
+  Future<void> _loadAllSeriesEpisodesRecorded(PerformanceSpan? trace) async {
     final item = _item;
-    if (item == null) return;
+    if (item == null) { trace?.end(outcome: 'no_item'); return; }
     final seriesId = item.type == 'Series' ? itemId : item.seriesId;
-    if (seriesId == null || seriesId.isEmpty) return;
-    if (_seriesEpisodesRequested) return;
+    if (seriesId == null || seriesId.isEmpty) { trace?.end(outcome: 'no_series'); return; }
+    if (_seriesEpisodesRequested) { trace?.end(outcome: 'already_requested'); return; }
     _seriesEpisodesRequested = true;
     try {
       final data = await _client.itemsApi.getEpisodes(
@@ -1043,9 +1057,11 @@ class ItemDetailViewModel extends ChangeNotifier {
         items,
         fallbackRating: _item?.officialRating,
       );
+      trace?.end(data: {'items': items.length});
       _seriesEpisodesLoaded = true;
       notifyListeners();
     } catch (_) {
+      trace?.end(outcome: 'api_error', data: {'retryOnRebuild': true});
       // Left unloaded and silent on purpose. The Modern layout calls this from
       // build, so the next rebuild gets another go, and notifying here would
       // turn that into a loop against a server that is down.
@@ -1056,7 +1072,7 @@ class ItemDetailViewModel extends ChangeNotifier {
   Future<void> refreshSeriesEpisodes() {
     _seriesEpisodesRequested = false;
     _seriesEpisodesLoaded = false;
-    return loadAllSeriesEpisodes();
+    return loadAllSeriesEpisodes(caller: 'refresh');
   }
 
   Future<void> _loadNextUp() async {

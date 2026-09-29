@@ -1,13 +1,15 @@
 name: cached_network_image
 description: Flutter library to load and cache network images.
   Can also be used with placeholder and error widgets.
-# Vendored fork of pub.dev cached_network_image 3.4.1. The one source change is
+# Vendored fork of pub.dev cached_network_image 3.4.1. One source change is
 # in lib/src/image_provider/multi_image_stream_completer.dart, which no longer
 # decodes a still image it already showed when a listener comes back to it.
 # Upstream decodes it again every time, and on Firefox web that second frame
 # paints blank so the image never shows again. Flutter's own
 # MultiFrameImageStreamCompleter already skips that decode, so this fork can be
-# retired once upstream does too.
+# retired once upstream does too and the optional performanceObserver hook
+# in cached_image_widget.dart has an upstream equivalent. That hook observes
+# existing builder callbacks without resolving or listening to images again.
 # The upstream tests, docs, dev_dependencies and analysis_options.yaml were
 # dropped since only lib/ is consumed here.
 homepage: https://github.com/Baseflow/flutter_cached_network_image

@@ -119,6 +119,10 @@ jobs:
           chmod +x build-android.sh
           ./build-android.sh
 
+      - name: Verify media transfer diagnostics
+        working-directory: android
+        run: ./gradlew :moonfin_native_video:testReleaseUnitTest --tests org.moonfin.nativevideo.MediaTransferMetricsTest --console=plain
+
       - uses: actions/upload-artifact@v4
         with:
           name: android
