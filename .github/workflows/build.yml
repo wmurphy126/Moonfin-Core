@@ -11,6 +11,14 @@ on:
         description: Run Android job
         type: boolean
         default: false
+      android_test_build:
+        description: Build only a mobile test APK that installs alongside the normal app
+        type: boolean
+        default: false
+      tests:
+        description: Run analyzer and Dart tests (can run without platform builds)
+        type: boolean
+        default: false
       ios:
         description: Run iOS job
         type: boolean
@@ -62,6 +70,10 @@ jobs:
   android:
     if: ${{ (github.event_name != 'workflow_dispatch' || inputs.run_all || inputs.android) && inputs.distribution != 'testflight' }}
     runs-on: ubuntu-latest
+    env:
+      MOONFIN_TEST_ID_SUFFIX: ${{ inputs.android_test_build && '.performance' || '' }}
+      MOONFIN_ANDROID_APK_ONLY: ${{ inputs.android_test_build && 'true' || 'false' }}
+      MOONFIN_ANDROID_TEST_BUILD_NUMBER: '30000201'
     steps:
       - uses: actions/checkout@v4
 
@@ -111,6 +123,10 @@ jobs:
         run: |
           chmod +x build-android.sh
           ./build-android.sh
+
+      - name: Verify media transfer diagnostics
+        working-directory: android
+        run: ./gradlew :moonfin_native_video:testReleaseUnitTest --tests org.moonfin.nativevideo.MediaTransferMetricsTest --console=plain
 
       - uses: actions/upload-artifact@v4
         with:
@@ -750,7 +766,7 @@ jobs:
   # nothing imports and a failing test are invisible to them. This job is
   # what the PR comment reads its Tests line from.
   tests:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_all }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_all || inputs.android || inputs.tests }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
