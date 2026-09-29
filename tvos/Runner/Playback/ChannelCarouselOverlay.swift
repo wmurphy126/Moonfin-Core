@@ -28,7 +28,7 @@ private let carouselInactivity: TimeInterval = 120
 /// scrim, with the centered channel's program above it. Native port of the
 /// Flutter overlay, so the two surfaces behave the same way.
 @MainActor
-final class ChannelCarouselOverlayViewController: UIViewController {
+final class ChannelCarouselOverlayViewController: UIViewController, RemotePlayerNavigable {
     var onChannelSelected: ((String) -> Void)?
 
     /// DOWN leaves the carousel and hands the player its controls.
@@ -404,6 +404,29 @@ final class ChannelCarouselOverlayViewController: UIViewController {
         }
     }
 
+    func handleRemoteNavigation(_ command: String) {
+        guard !dismissed else { return }
+        resetInactivity()
+        switch command {
+        case "moveleft": move(by: -1)
+        case "moveright": move(by: 1)
+        case "back": dismissCarousel()
+        case "movedown": dismissCarousel(showingControls: true)
+        case "select": tuneCenteredChannel()
+        default: break
+        }
+    }
+
+    private func tuneCenteredChannel() {
+        guard entries.indices.contains(centeredIndex) else { return }
+        let id = entries[centeredIndex].channelId
+        dismissed = true
+        stopTimers()
+        dismiss(animated: false) { [weak self] in
+            self?.onChannelSelected?(id)
+        }
+    }
+
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         resetInactivity()
         for press in presses {
@@ -413,13 +436,7 @@ final class ChannelCarouselOverlayViewController: UIViewController {
                 // recognizer decides on release.
                 return
             case .select:
-                guard entries.indices.contains(centeredIndex) else { return }
-                let id = entries[centeredIndex].channelId
-                dismissed = true
-                stopTimers()
-                dismiss(animated: false) { [weak self] in
-                    self?.onChannelSelected?(id)
-                }
+                tuneCenteredChannel()
                 return
             case .leftArrow:
                 refreshWatchdog()

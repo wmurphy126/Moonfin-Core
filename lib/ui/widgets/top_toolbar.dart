@@ -1994,7 +1994,10 @@ class _LibrariesDropdownState extends State<_LibrariesDropdown> {
 
   // The dropdown is an overlay entry rather than a route, so nothing pops it on
   // back. Registering it lets the key close it instead of leaving the page.
-  void _closeFromBack() => _hideDropdown(focusButton: true);
+  bool _closeFromBack() {
+    _hideDropdown(focusButton: true);
+    return true;
+  }
 
   double _calculateMenuWidth(BuildContext context, double screenWidth) {
     final baseStyle = (Theme.of(context).textTheme.bodyMedium ??

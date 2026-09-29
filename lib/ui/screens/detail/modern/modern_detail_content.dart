@@ -5341,8 +5341,9 @@ class _DetailsContainerState extends State<_DetailsContainer> with FocusStateMix
     InlineBackInterceptor.remove(_handleBack);
   }
 
-  void _handleBack() {
+  bool _handleBack() {
     widget.onNavigateUp?.call();
+    return true;
   }
 
   @override

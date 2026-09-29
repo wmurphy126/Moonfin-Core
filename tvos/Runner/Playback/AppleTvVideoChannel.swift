@@ -44,6 +44,23 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
                 }
                 return
             }
+            if call.method == "setVolume" {
+                Task { @MainActor in
+                    guard let player = self?.player else {
+                        result(FlutterError(code: "no_player", message: "No playback session", details: nil))
+                        return
+                    }
+                    let args = call.arguments as? [String: Any]
+                    guard let value = (args?["volume"] as? NSNumber)?.doubleValue, value.isFinite else {
+                        result(FlutterError(code: "invalid_volume", message: "Expected a finite percentage", details: nil))
+                        return
+                    }
+                    Self.lastCommand = call.method
+                    player.setUserVolume(Float(min(max(value, 0), 100) / 100))
+                    result(nil)
+                }
+                return
+            }
             result(nil)
             Task { @MainActor in self?.handle(call) }
         }
@@ -74,6 +91,10 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
             present(audioOnly: (args["audioOnly"] as? Bool) ?? false)
         case "dismiss":
             dismiss()
+        case "remoteNavigation":
+            if let command = args["command"] as? String {
+                playerVC?.handleRemoteNavigation(command)
+            }
         case "setSource":
             setSource(args)
         case "setEngineLogForwarding":
@@ -162,8 +183,6 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
             player?.setClosedCaptionTrack((args["id"] as? NSNumber)?.int32Value ?? 0)
         case "disableSubtitleTrack":
             player?.disableSubtitles()
-        case "setVolume":
-            break
         case "setAudioDelay":
             player?.setAudioDelay(ms(args["delayMs"]))
         case "setSubtitleDelay":
@@ -394,6 +413,9 @@ final class AppleTvVideoChannel: NSObject, FlutterStreamHandler {
         player.setForceSubtitlesDisabledOnStart(
             (args["forceSubtitlesDisabledOnStart"] as? Bool) ?? false)
         player.setReplayGainDb((args["normalizationGainDb"] as? NSNumber)?.doubleValue)
+        if let volume = (args["volume"] as? NSNumber)?.doubleValue, volume.isFinite {
+            player.setUserVolume(Float(min(max(volume, 0), 100) / 100))
+        }
 
         Task {
             let started = Date()

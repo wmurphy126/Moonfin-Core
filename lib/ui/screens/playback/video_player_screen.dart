@@ -63,7 +63,9 @@ import '../../../playback/hdr_composition.dart';
 import '../../../playback/hdr_output_controller.dart';
 import '../../../playback/hdr_overlay_channel.dart';
 import 'hdr_overlay_capture.dart';
+import '../../../util/focus/back_key_release.dart';
 import '../../../util/focus/dpad_keys.dart';
+import '../../../util/focus/gamepad/gamepad_key_synthesizer.dart';
 import '../../../util/play_method_label.dart';
 import '../../../util/platform_detection.dart';
 import '../../../util/playback_time_label.dart';
@@ -263,6 +265,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   bool _subtitleReapplyRetryScheduled = false;
   bool _isStopping = false;
   bool _readyToPop = false;
+  VoidCallback? _cancelPopAfterBackKeyUp;
   DateTime? _suppressTvLifecycleExitUntil;
   bool _isOsdLocked = false;
   String? _remotePlaybackState;
@@ -351,9 +354,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   final _tvTransportFirstFocus = FocusNode(
     debugLabel: 'video_player_tv_transport_first',
   );
-  final _tvBottomPrimaryFocus = FocusNode(
-    debugLabel: 'video_player_tv_bottom_primary',
-  );
+  final _primaryPlayFocus = FocusNode(debugLabel: 'video_player_primary_play');
   final _tvSecondaryFocus = FocusNode(debugLabel: 'video_player_tv_secondary');
   final _tvTransportLastFocus = FocusNode(
     debugLabel: 'video_player_tv_transport_last',
@@ -1017,6 +1018,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   @override
   void dispose() {
+    _cancelPopAfterBackKeyUp?.call();
     _trickplayLoadGeneration++;
     _hdrStatus?.removeListener(_onHdrStatusChanged);
     _hdrRendererCycling?.removeListener(_onHdrStatusChanged);
@@ -1056,8 +1058,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (PlatformDetection.isDesktop) {
       unawaited(_prefs.set(UserPreferences.playerVolume, _playerVolume));
     }
+    _volumeListenerSub?.cancel();
     if (_useSystemVolume) {
-      _volumeListenerSub?.cancel();
       VolumeController.instance.removeListener();
     }
     if (PlatformDetection.isMobile) {
@@ -1096,7 +1098,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _tvNextUpPlayFocus.dispose();
     _tvNextUpDismissFocus.dispose();
     _tvTransportFirstFocus.dispose();
-    _tvBottomPrimaryFocus.dispose();
+    _primaryPlayFocus.dispose();
     _tvSecondaryFocus.dispose();
     _tvTransportLastFocus.dispose();
     _tvSecondaryLastFocus.dispose();
@@ -2685,7 +2687,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       _skipTo = null;
     });
     _hideTimer?.cancel();
-    _focusTvNextUpPlay();
+    _focusNextUpPlay();
   }
 
   Future<void> _handleNextUpPlay() async {
@@ -2725,16 +2727,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     unawaited(_exitPlayback());
   }
 
-  void _focusTvNextUpPlay({int attempt = 0}) {
-    if (!PlatformDetection.isTV || !_showNextUp) return;
+  void _focusNextUpPlay({int attempt = 0}) {
+    if (!_showNextUp) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_showNextUp) return;
-      _tvNextUpPlayFocus.requestFocus();
-
-      if (!_tvNextUpPlayFocus.hasFocus && attempt < 8) {
+      if (ModalRoute.of(context)?.isCurrent != true) return;
+      if (_tvNextUpPlayFocus.context != null) {
+        _tvNextUpPlayFocus.requestFocus();
+        return;
+      }
+      if (attempt < 8) {
         Future<void>.delayed(const Duration(milliseconds: 50), () {
           if (!mounted) return;
-          _focusTvNextUpPlay(attempt: attempt + 1);
+          _focusNextUpPlay(attempt: attempt + 1);
         });
       }
     });
@@ -2896,16 +2901,22 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         _readyToPop = true;
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          if (context.canPop()) {
-            context.pop();
-          } else {
-            Navigator.of(context).pop();
-          }
-        }
+        if (!mounted) return;
+        _cancelPopAfterBackKeyUp = runAfterBackKeyUp(_popPlayerRoute);
       });
     }
     unawaited(_manager.stop(userInitiated: false));
+  }
+
+  void _popPlayerRoute() {
+    // Newer Android sends the system back before the key up reaches here, and
+    // that back has already popped the player.
+    if (ModalRoute.of(context)?.isCurrent == false) return;
+    if (context.canPop()) {
+      context.pop();
+    } else {
+      Navigator.of(context).pop();
+    }
   }
 
   Future<void> _restoreSystemUiForExit() async {
@@ -2972,7 +2983,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (!PlatformDetection.isTV) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_controlsVisible) return;
-      _tvBottomPrimaryFocus.requestFocus();
+      _primaryPlayFocus.requestFocus();
     });
   }
 
@@ -3019,7 +3030,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   void _focusPreferredTvOverlayTarget() {
     if (!PlatformDetection.isTV) return;
     if (_showNextUp) {
-      _focusTvNextUpPlay();
+      _focusNextUpPlay();
       return;
     }
     if (_isSkipSegmentButtonVisible) {
@@ -3638,8 +3649,44 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
 
     final primaryFocus = FocusManager.instance.primaryFocus;
+    final fromRemote = GamepadKeySynthesizer.isRemote(event.physicalKey);
+    if (fromRemote &&
+        !PlatformDetection.isTV &&
+        (event.logicalKey.isDirectional ||
+            event.logicalKey == LogicalKeyboardKey.select)) {
+      // A prompt above the player owns navigation even when the OSD is hidden.
+      if (_showNextUp) {
+        if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+          _tvNextUpDismissFocus.requestFocus();
+        } else if (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
+            (primaryFocus != _tvNextUpPlayFocus &&
+                primaryFocus != _tvNextUpDismissFocus)) {
+          _tvNextUpPlayFocus.requestFocus();
+        } else if (event.logicalKey == LogicalKeyboardKey.select) {
+          return KeyEventResult.ignored;
+        }
+        return KeyEventResult.handled;
+      }
+      // A session D-pad navigates the visible controls. Desktop arrow-key
+      // seek/volume shortcuts remain available to the local keyboard.
+      if (!_controlsVisible || primaryFocus == _overlayFocus) {
+        _showControls();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted ||
+              !_controlsVisible ||
+              _showNextUp ||
+              ModalRoute.of(context)?.isCurrent != true) {
+            return;
+          }
+          _primaryPlayFocus.requestFocus();
+        });
+        return KeyEventResult.handled;
+      }
+      _scheduleHide();
+      return KeyEventResult.ignored;
+    }
 
-    if (PlatformDetection.isTV) {
+    if (PlatformDetection.isTV || fromRemote) {
       if (_showNextUp) {
         switch (event.logicalKey) {
           case LogicalKeyboardKey.arrowLeft:
@@ -4082,9 +4129,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                         SkipSegmentOverlay(
                           segment: _skipSegment!,
                           onSkip: _skipCurrentSegment,
-                          focusNode: PlatformDetection.isTV
-                              ? _tvSkipSegmentFocus
-                              : null,
+                          focusNode: _tvSkipSegmentFocus,
                           onDismiss: _clearSkipSegment,
                           positionStream: _state.positionStream,
                           initialPosition: _state.position,
@@ -4120,12 +4165,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                               _prefs.get(UserPreferences.autoplayNextEpisode)
                               ? _handleNextUpPlay
                               : _handleNextUpCancel,
-                          focusNode: PlatformDetection.isTV
-                              ? _tvNextUpPlayFocus
-                              : null,
-                          dismissFocusNode: PlatformDetection.isTV
-                              ? _tvNextUpDismissFocus
-                              : null,
+                          focusNode: _tvNextUpPlayFocus,
+                          dismissFocusNode: _tvNextUpDismissFocus,
                         ),
                     ],
                   ),
@@ -5059,8 +5100,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                 case LogicalKeyboardKey.arrowUp:
                                   return KeyEventResult.handled;
                                 case LogicalKeyboardKey.arrowDown:
-                                  if (_tvBottomPrimaryFocus.context != null) {
-                                    _tvBottomPrimaryFocus.requestFocus();
+                                  if (_primaryPlayFocus.context != null) {
+                                    _primaryPlayFocus.requestFocus();
                                   }
                                   return KeyEventResult.handled;
                                 case LogicalKeyboardKey.select:
@@ -5511,7 +5552,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                       : _resumeWithConfiguredRewind(),
                   size: buttonIconSize,
                   extent: buttonExtent,
-                  focusNode: _tvBottomPrimaryFocus,
+                  focusNode: _primaryPlayFocus,
                   tooltip: _tooltipMessage(
                     isPlaying ? l10n.pause : l10n.play,
                     shortcut: 'Space',
@@ -6193,6 +6234,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         .toDouble();
     unawaited(_manager.backend?.setVolume(_playerVolume));
     _reportVolumeToManager();
+    // A session remote sets the backend and reports its level without coming
+    // through here, so the slider follows it and a new backend keeps it.
+    _volumeListenerSub = _manager.volumeStream.listen((level) {
+      if (!mounted || (level - _playerVolume).abs() < 0.5) return;
+      setState(() => _playerVolume = level);
+      _persistPlayerVolume();
+    });
   }
 
   void _persistPlayerVolume() {
@@ -6700,6 +6748,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                   isPlaying ? _manager.pause() : _resumeWithConfiguredRewind(),
               size: 64 * scale,
               extent: 92 * scale,
+              focusNode: _primaryPlayFocus,
               tooltip: _tooltipMessage(
                 isPlaying ? l10n.pause : l10n.play,
                 shortcut: 'Space',

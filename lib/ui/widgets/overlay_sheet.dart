@@ -27,19 +27,23 @@ class DialogBackSuppressor {
   }
 }
 
+/// Back handlers for things that close in place rather than as routes. Each
+/// one says whether it did anything, so a handler with nothing left to do
+/// passes Back on instead of swallowing every press.
 class InlineBackInterceptor {
   InlineBackInterceptor._();
 
-  static final List<VoidCallback> _handlers = <VoidCallback>[];
+  static final List<bool Function()> _handlers = <bool Function()>[];
 
-  static void push(VoidCallback onBack) => _handlers.add(onBack);
+  static void push(bool Function() onBack) => _handlers.add(onBack);
 
-  static void remove(VoidCallback onBack) => _handlers.remove(onBack);
+  static void remove(bool Function() onBack) => _handlers.remove(onBack);
 
   static bool handleBack() {
-    if (_handlers.isEmpty) return false;
-    _handlers.last();
-    return true;
+    for (final handler in _handlers.reversed) {
+      if (handler()) return true;
+    }
+    return false;
   }
 }
 
@@ -185,14 +189,24 @@ Future<T?> showFocusRestoringModalBottomSheet<T>({
 }
 
 class OverlaySheetController {
-  static final List<VoidCallback> _openSheetCloseHandles = <VoidCallback>[];
+  static final _openSheetCloseHandles =
+      <Future<void> Function({bool restoreFocus})>[];
 
   static bool get hasOpenSheet => _openSheetCloseHandles.isNotEmpty;
 
   static bool closeTopSheet() {
     if (_openSheetCloseHandles.isEmpty) return false;
-    _openSheetCloseHandles.last();
+    unawaited(_openSheetCloseHandles.last(restoreFocus: true));
     return true;
+  }
+
+  /// Navigation replaces the page below these sheets, so its old focus isn't
+  /// restored once they finish closing.
+  static Future<void> closeAllSheets() async {
+    await Future.wait([
+      for (final close in _openSheetCloseHandles.toList().reversed)
+        close(restoreFocus: false),
+    ]);
   }
 
   static Future<T?> show<T>(
@@ -322,12 +336,13 @@ class _OverlaySheetState<T> extends State<_OverlaySheet<T>>
   bool _closing = false;
   bool _restoreFocusOnClose = true;
   Future<void>? _closeFuture;
-  late final VoidCallback _registryCloseHandle;
+  late final Future<void> Function({bool restoreFocus}) _registryCloseHandle;
 
   @override
   void initState() {
     super.initState();
-    _registryCloseHandle = () => _close();
+    _registryCloseHandle = ({bool restoreFocus = true}) =>
+        _close(null, restoreFocus);
     OverlaySheetController._openSheetCloseHandles.add(_registryCloseHandle);
     _controller = AnimationController(
       vsync: this,
@@ -356,21 +371,32 @@ class _OverlaySheetState<T> extends State<_OverlaySheet<T>>
   void dispose() {
     OverlaySheetController._openSheetCloseHandles.remove(_registryCloseHandle);
     _controller.dispose();
+    if (!widget.completer.isCompleted) widget.completer.complete();
     _scopeNode.dispose();
     super.dispose();
   }
 
   Future<void> _close([T? result, bool restoreFocus = true]) {
-    if (_closing) return _closeFuture ?? Future.value();
+    if (_closing) {
+      if (!restoreFocus) _restoreFocusOnClose = false;
+      return _closeFuture ?? Future.value();
+    }
     _restoreFocusOnClose = restoreFocus;
     _closing = true;
-    _closeFuture = _controller.reverse().whenComplete(() {
-      if (!widget.completer.isCompleted) {
-        widget.completer.complete(result);
-      }
-      widget.onClosed(_restoreFocusOnClose);
-    });
+    _closeFuture = _animateClose(result);
     return _closeFuture!;
+  }
+
+  Future<void> _animateClose(T? result) async {
+    try {
+      await _controller.reverse().orCancel;
+    } on TickerCanceled {
+      // Disposal already removed the sheet, but navigation still has to settle.
+      return;
+    }
+    if (!mounted) return;
+    if (!widget.completer.isCompleted) widget.completer.complete(result);
+    widget.onClosed(_restoreFocusOnClose);
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {

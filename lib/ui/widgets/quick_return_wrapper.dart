@@ -131,7 +131,7 @@ class _QuickReturnWrapperState extends State<QuickReturnWrapper>
   void _syncInterceptor() {
     final wanted = PlatformDetection.isTV && _isScrolledAway && _routeIsOnTop;
     if (wanted && !_interceptorRegistered) {
-      InlineBackInterceptor.push(_returnToStart);
+      InlineBackInterceptor.push(_returnFromBack);
       _interceptorRegistered = true;
     } else if (!wanted) {
       _unregisterInterceptor();
@@ -140,8 +140,17 @@ class _QuickReturnWrapperState extends State<QuickReturnWrapper>
 
   void _unregisterInterceptor() {
     if (!_interceptorRegistered) return;
-    InlineBackInterceptor.remove(_returnToStart);
+    InlineBackInterceptor.remove(_returnFromBack);
     _interceptorRegistered = false;
+  }
+
+  /// Focus on [topFocusNode] already means the screen is back at its start, so
+  /// Back leaves from there even if the offset hasn't settled under the
+  /// threshold.
+  bool _returnFromBack() {
+    if (widget.topFocusNode?.hasFocus ?? false) return false;
+    _returnToStart();
+    return true;
   }
 
   void _updateScrollState() {

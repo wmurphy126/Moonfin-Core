@@ -35,6 +35,7 @@ import 'preference/preference_constants.dart' show GlassSettledQuality;
 import 'preference/user_preferences.dart';
 import 'syncplay/syncplay_manager.dart';
 import 'ui/navigation/app_router.dart';
+import 'ui/navigation/deferred_route_pop.dart';
 import 'ui/navigation/deep_link_navigator.dart';
 import 'ui/navigation/destinations.dart';
 import 'ui/navigation/home_refresh_bus.dart';
@@ -62,6 +63,7 @@ import 'ui/widgets/overlay_sheet.dart';
 import 'package:moonfin_design/moonfin_design.dart';
 import 'util/focus/key_event_utils.dart';
 import 'util/focus/gamepad/gamepad_navigation_scope.dart';
+import 'util/focus/gamepad/gamepad_key_synthesizer.dart';
 import 'util/focus/open_popup.dart';
 import 'package:custom_tv_text_field/custom_tv_text_field.dart';
 
@@ -713,6 +715,7 @@ class _GlobalShortcutScopeState extends State<_GlobalShortcutScope>
 
     final isBackspace = key == LogicalKeyboardKey.backspace;
     if (key.isBackKey) {
+      final fromRemote = GamepadKeySynthesizer.isRemote(event.physicalKey);
       if (isBackspace && _isEditingText()) {
         return false;
       }
@@ -724,6 +727,13 @@ class _GlobalShortcutScopeState extends State<_GlobalShortcutScope>
         if (PlatformDetection.isAndroid && key == LogicalKeyboardKey.goBack) {
           DialogBackSuppressor.markDismissed();
         }
+        return true;
+      }
+      // Dismiss a receiving phone's keyboard before leaving its page.
+      if (fromRemote &&
+          _isEditingText() &&
+          View.of(context).viewInsets.bottom > 0) {
+        FocusManager.instance.primaryFocus?.unfocus();
         return true;
       }
       if (OverlaySheetController.closeTopSheet()) {
@@ -765,11 +775,10 @@ class _GlobalShortcutScopeState extends State<_GlobalShortcutScope>
         if (PlatformDetection.isAndroid && key == LogicalKeyboardKey.goBack) {
           return true;
         }
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) return;
-          appRouter.pop();
-        });
+        scheduleRoutePop(appRouter, isMounted: () => mounted);
       } else if (!_exitDialogShowing) {
+        // A server remote only navigates, it can't quit the app it's driving.
+        if (fromRemote) return true;
         if (PlatformDetection.isAndroid && key == LogicalKeyboardKey.goBack) {
           return true;
         }

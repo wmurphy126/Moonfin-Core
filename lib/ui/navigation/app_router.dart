@@ -197,6 +197,7 @@ final appRouter = GoRouter(
     FocusRouteObserver(),
     RetroArtworkRouteObserver.instance,
     routeLifecycleObserver,
+    pageRouteLifecycleObserver,
     PlayerRouteObserver.instance,
   ],
   redirect: (context, state) {

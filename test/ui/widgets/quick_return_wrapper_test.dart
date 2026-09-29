@@ -121,6 +121,42 @@ void main() {
       await tester.pumpAndSettle();
     });
 
+    testWidgets('gives Back up once the return has put focus on the top', (
+      tester,
+    ) async {
+      final controller = ScrollController();
+      addTearDown(controller.dispose);
+      final top = FocusNode();
+      addTearDown(top.dispose);
+      await tester.pumpWidget(
+        _app(
+          QuickReturnWrapper(
+            scrollController: controller,
+            topFocusNode: top,
+            child: Column(
+              children: [
+                Focus(focusNode: top, child: const SizedBox(height: 40)),
+                Expanded(child: _scrollingBody(controller)),
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      controller.jumpTo(500);
+      await tester.pump();
+      expect(InlineBackInterceptor.handleBack(), isTrue);
+      await tester.pumpAndSettle();
+      expect(top.hasFocus, isTrue);
+
+      // Issue #1686: a return that left the offset past the threshold kept
+      // the handler, so every later Back repeated it instead of leaving.
+      controller.jumpTo(500);
+      await tester.pump();
+      expect(InlineBackInterceptor.handleBack(), isFalse);
+    });
+
     testWidgets('leaves nothing registered after disposal', (tester) async {
       final controller = await _pumpWrapper(tester);
       controller.jumpTo(500);
@@ -211,6 +247,29 @@ void main() {
     await tester.pump();
 
     expect(tester.takeException(), isNull);
+  });
+
+  test('a handler with nothing to do passes Back to the one below it', () {
+    var below = 0;
+    bool closeBelow() {
+      below++;
+      return true;
+    }
+
+    bool nothingLeft() => false;
+
+    InlineBackInterceptor.push(closeBelow);
+    InlineBackInterceptor.push(nothingLeft);
+    addTearDown(() {
+      InlineBackInterceptor.remove(nothingLeft);
+      InlineBackInterceptor.remove(closeBelow);
+    });
+
+    expect(InlineBackInterceptor.handleBack(), isTrue);
+    expect(below, 1);
+
+    InlineBackInterceptor.remove(closeBelow);
+    expect(InlineBackInterceptor.handleBack(), isFalse);
   });
 
   group('driven by a notifier instead of a controller', () {

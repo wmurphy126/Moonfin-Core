@@ -5,21 +5,24 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/widgets.dart'
     show
-        ActivateIntent,
         Actions,
+        ActivateIntent,
         AppLifecycleState,
         FocusManager,
         PageRoute,
-        TraversalDirection,
         WidgetsBinding;
 
 import '../../l10n/current_app_localizations.dart';
 import '../../ui/navigation/app_router.dart';
 import '../../ui/navigation/destinations.dart';
 import '../../ui/navigation/home_refresh_bus.dart';
+import '../../ui/screensaver/screensaver_controller.dart';
+import '../../ui/widgets/overlay_sheet.dart';
 import '../../ui/widgets/floating_notification.dart';
 
 import 'package:get_it/get_it.dart';
+import 'package:go_router/go_router.dart';
+import 'package:volume_controller/volume_controller.dart';
 import 'package:logger/logger.dart';
 import 'package:playback_core/playback_core.dart';
 import 'package:server_core/server_core.dart';
@@ -52,6 +55,7 @@ import '../../preference/user_preferences.dart';
 import '../../syncplay/syncplay_manager.dart';
 import '../../util/fullscreen_helper.dart';
 import '../../util/platform_detection.dart';
+import '../../util/focus/gamepad/gamepad_key_synthesizer.dart';
 import '../store/authentication_preferences.dart';
 import '../store/authentication_store.dart';
 import '../store/credential_store.dart';
@@ -79,7 +83,7 @@ class SessionRepository {
     'VolumeDown',
   ];
 
-  static const List<String> _tvNavigationRemoteCommands = [
+  static const List<String> _navigationRemoteCommands = [
     'MoveUp',
     'MoveDown',
     'MoveLeft',
@@ -90,7 +94,7 @@ class SessionRepository {
 
   List<String> get _supportedRemoteCommands => [
     ..._baseSupportedRemoteCommands,
-    if (PlatformDetection.isTV) ..._tvNavigationRemoteCommands,
+    ..._navigationRemoteCommands,
     // Nothing but a desktop has a window to resize, so anywhere else would be
     // offering a button that does nothing.
     if (PlatformDetection.isDesktop) 'ToggleFullscreen',
@@ -117,7 +121,8 @@ class SessionRepository {
   StreamSubscription<ServerWebSocketMessage>? _pluginEventSubscription;
   StreamSubscription<void>? _socketConnectionSubscription;
   double _lastUnmutedVolume = 100;
-  bool _remoteMuted = false;
+  Future<void> _remoteVolumeFlight = Future.value();
+  int _remoteVolumeGeneration = 0;
   bool _hasCheckedWriteAccess = false;
 
   static const Duration _socketIdleGrace = Duration(seconds: 60);
@@ -134,8 +139,16 @@ class SessionRepository {
     this._socketHandler,
     this._serverRepository,
     this._userRepository,
-    this._pluginSyncService,
-  );
+    this._pluginSyncService, {
+    GoRouter? router,
+  }) : _router = router ?? appRouter;
+
+  final GoRouter _router;
+
+  String get _remoteRoutePath =>
+      _router.routerDelegate.currentConfiguration.isEmpty
+      ? _router.routeInformationProvider.value.uri.path
+      : _router.state.uri.path;
 
   String? get activeServerId => _activeServerId;
   String? get activeUserId => _activeUserId;
@@ -222,6 +235,8 @@ class SessionRepository {
     bool validateToken = false,
   }) async {
     _setState(SessionState.switching);
+    _remoteVolumeGeneration++;
+    _remoteNavigationGeneration++;
     _remoteSearch?.close();
     _pluginSyncService.resetState();
     if (GetIt.instance.isRegistered<AchievementsService>()) {
@@ -516,6 +531,8 @@ class SessionRepository {
   /// token. The push unregister and the logout both authenticate with it, so
   /// sending them would only add 401s to the burst that got us here.
   Future<void> destroyCurrentSession({bool tokenKnownInvalid = false}) async {
+    _remoteVolumeGeneration++;
+    _remoteNavigationGeneration++;
     _remoteSearch?.close();
     final serverId = _activeServerId;
     final userId = _activeUserId;
@@ -614,7 +631,11 @@ class SessionRepository {
   void _bindRemoteCommandHandling() {
     _remoteCommandSubscription?.cancel();
     _remoteCommandSubscription = _socketHandler.events.listen(
-      (event) => unawaited(_handleRemoteCommand(event)),
+      (event) => unawaited(
+        _handleRemoteCommand(event).catchError((Object error) {
+          _logger.w('Remote command failed: ${error.runtimeType}');
+        }),
+      ),
     );
   }
 
@@ -664,7 +685,26 @@ class SessionRepository {
       case PlaystateMessage():
         await _handlePlaystateMessage(event);
       case GeneralCommandMessage():
-        await _handleGeneralCommandMessage(event);
+        if (const {
+          'setvolume',
+          'volumeup',
+          'volumedown',
+          'mute',
+          'unmute',
+          'togglemute',
+        }.contains(event.name.toLowerCase())) {
+          final generation = _remoteVolumeGeneration;
+          final result = _remoteVolumeFlight.then((_) async {
+            if (generation == _remoteVolumeGeneration) {
+              await _handleGeneralCommandMessage(event);
+            }
+          });
+          // A failed setter shouldn't block the next adjustment.
+          _remoteVolumeFlight = result.catchError((_) {});
+          await result;
+        } else {
+          await _handleGeneralCommandMessage(event);
+        }
       default:
         break;
     }
@@ -686,30 +726,77 @@ class SessionRepository {
 
   Future<void> _setLocalVolume(PlaybackManager manager, double volume) async {
     final clamped = volume.clamp(0, 100).toDouble();
-    manager.reportVolumeState(volume: clamped, isMuted: clamped <= 0);
     final backend = manager.backend;
-    if (backend == null) {
+    if (backend == null) return;
+    if (PlatformDetection.isMobile) {
+      // Mobile playback keeps player gain at full and adjusts system volume.
+      await VolumeController.instance.setVolume(clamped / 100);
+      final actual = await VolumeController.instance.getVolume();
+      manager.reportVolumeState(
+        volume: actual * 100,
+        isMuted: actual <= 0,
+        reportImmediately: true,
+      );
+    } else {
+      await backend.setVolume(clamped);
+      manager.reportVolumeState(
+        volume: clamped,
+        isMuted: clamped <= 0,
+        reportImmediately: true,
+      );
+    }
+    if (manager.volume > 0) _lastUnmutedVolume = manager.volume;
+  }
+
+  Future<void> _setRemoteMuted(PlaybackManager manager, bool muted) async {
+    final current = await _currentVolume(manager);
+    if (muted && current > 0) {
+      _lastUnmutedVolume = current;
+      await _setLocalVolume(manager, 0);
+    } else if (!muted && current <= 0) {
+      await _setLocalVolume(manager, _lastUnmutedVolume);
+    }
+  }
+
+  Future<double> _currentVolume(PlaybackManager manager) async =>
+      PlatformDetection.isMobile && manager.backend != null
+      ? await VolumeController.instance.getVolume() * 100
+      : manager.volume;
+
+  void _wakeRemoteScreen() {
+    if (!GetIt.instance.isRegistered<ScreensaverController>()) return;
+    final screensaver = GetIt.instance<ScreensaverController>();
+    screensaver.dismissIfVisible();
+    screensaver.notifyInteraction();
+  }
+
+  final _remoteKeys = GamepadKeySynthesizer.remote();
+  int _remoteNavigationGeneration = 0;
+
+  Future<void> _navigateRemote(String command, GamepadNavKey key) async {
+    final backend = GetIt.instance<PlaybackManager>().backend;
+    if (backend is AppleTvBackend && backend.isPlayerPresented) {
+      // Native playback owns its input, including any menu above the player.
+      await backend.sendRemoteNavigation(command);
       return;
     }
-    await backend.setVolume(clamped);
-  }
-
-  void _moveFocus(TraversalDirection direction) {
-    if (!PlatformDetection.isTV) return;
-    FocusManager.instance.primaryFocus?.focusInDirection(direction);
-  }
-
-  void _activateFocused() {
-    if (!PlatformDetection.isTV) return;
-    final focusContext = FocusManager.instance.primaryFocus?.context;
-    if (focusContext != null) {
-      Actions.maybeInvoke<ActivateIntent>(focusContext, const ActivateIntent());
+    final handled = _remoteKeys.tap(key);
+    if (!handled && key == GamepadNavKey.select) {
+      // Cupertino's default shortcuts don't map the TV Select key.
+      final context = FocusManager.instance.primaryFocus?.context;
+      if (context != null) Actions.maybeInvoke(context, const ActivateIntent());
+    }
+    if (!handled && key == GamepadNavKey.back) {
+      await _router.routerDelegate.navigatorKey.currentState?.maybePop();
     }
   }
 
-  double _normalizeVolume(String raw) {
-    final parsed = double.tryParse(raw) ?? 100;
-    if (parsed <= 1) {
+  double? _normalizeVolume(String raw) {
+    final parsed = double.tryParse(raw);
+    if (parsed == null || !parsed.isFinite) return null;
+    // Session commands send a percentage, so 1 means 1%. Only a value between
+    // 0 and 1 is read as a fraction.
+    if (parsed > 0 && parsed < 1) {
       return (parsed * 100).clamp(0, 100).toDouble();
     }
     return parsed.clamp(0, 100).toDouble();
@@ -803,6 +890,7 @@ class SessionRepository {
     int startIndex,
     PlayMessage message,
   ) async {
+    _remoteNavigationGeneration++;
     _remoteSearch?.close();
     final item = items[startIndex];
     final isLiveTv = _isLiveTvItem(item);
@@ -935,60 +1023,37 @@ class SessionRepository {
         final raw = message.arguments['Volume'];
         if (raw != null) {
           final volume = _normalizeVolume(raw);
-          await _setLocalVolume(manager, volume);
-          if (volume > 0) {
-            _lastUnmutedVolume = volume;
-            _remoteMuted = false;
-          } else {
-            _remoteMuted = true;
-          }
+          if (volume != null) await _setLocalVolume(manager, volume);
         }
       case 'mute':
-        if (!_remoteMuted) {
-          _remoteMuted = true;
-          await _setLocalVolume(manager, 0);
-        }
+        await _setRemoteMuted(manager, true);
       case 'unmute':
-        _remoteMuted = false;
-        await _setLocalVolume(manager, _lastUnmutedVolume);
+        await _setRemoteMuted(manager, false);
       case 'togglemute':
-        _remoteMuted = !_remoteMuted;
-        await _setLocalVolume(manager, _remoteMuted ? 0 : _lastUnmutedVolume);
+        await _setRemoteMuted(manager, await _currentVolume(manager) > 0);
       case 'volumeup':
-        final raised = manager.volume + _volumeStep;
+        final raised = await _currentVolume(manager) + _volumeStep;
         await _setLocalVolume(manager, raised);
-        _remoteMuted = raised <= 0;
-        if (!_remoteMuted) {
-          _lastUnmutedVolume = raised.clamp(0, 100).toDouble();
-        }
       case 'volumedown':
-        final lowered = manager.volume - _volumeStep;
+        final lowered = await _currentVolume(manager) - _volumeStep;
         await _setLocalVolume(manager, lowered);
-        _remoteMuted = lowered <= 0;
-        if (!_remoteMuted) {
-          _lastUnmutedVolume = lowered.clamp(0, 100).toDouble();
-        }
       case 'togglefullscreen':
         await FullscreenHelper.toggle();
       case 'moveup':
-        _moveFocus(TraversalDirection.up);
+        await _navigateRemote('moveup', GamepadNavKey.up);
       case 'movedown':
-        _moveFocus(TraversalDirection.down);
+        await _navigateRemote('movedown', GamepadNavKey.down);
       case 'moveleft':
-        _moveFocus(TraversalDirection.left);
+        await _navigateRemote('moveleft', GamepadNavKey.left);
       case 'moveright':
-        _moveFocus(TraversalDirection.right);
+        await _navigateRemote('moveright', GamepadNavKey.right);
       case 'select':
-        _activateFocused();
+        await _navigateRemote('select', GamepadNavKey.select);
       case 'back':
-        _remoteSearch?.close();
-        if (PlatformDetection.isTV) {
-          if (appRouter.canPop()) {
-            appRouter.pop();
-          } else {
-            appRouter.go(Destinations.home);
-          }
-        }
+        _remoteNavigationGeneration++;
+        // An attached Search ends with its route. Back may only hide a keyboard.
+        if (_remoteSearch?.opening == true) _remoteSearch?.close();
+        await _navigateRemote('back', GamepadNavKey.back);
       case 'setaudiostreamindex':
         final index = _parseIntArg(message.arguments, 'Index');
         if (index != null) {
@@ -1015,9 +1080,23 @@ class SessionRepository {
           await _setShuffleMode(manager, mode);
         }
       case 'gohome':
+        _wakeRemoteScreen();
+        final generation = ++_remoteNavigationGeneration;
         _remoteSearch?.close();
+        CustomTVTextField.closeTopKeyboard();
+        _router.routerDelegate.navigatorKey.currentState?.popUntil(
+          (route) => route is PageRoute,
+        );
+        final backend = manager.backend;
+        if (OverlaySheetController.hasOpenSheet) {
+          await OverlaySheetController.closeAllSheets();
+        }
+        if (generation != _remoteNavigationGeneration) return;
         await manager.stop(userInitiated: false);
-        appRouter.go(Destinations.home);
+        if (generation != _remoteNavigationGeneration) return;
+        if (backend is AppleTvBackend) await backend.dismissPlayer();
+        if (generation != _remoteNavigationGeneration) return;
+        _router.go(Destinations.home);
       case 'gotosearch':
         await _openRemoteSearch(
           manager,
@@ -1027,11 +1106,11 @@ class SessionRepository {
         final search = _remoteSearch;
         if (search != null &&
             !search.opening &&
-            appRouter.routeInformationProvider.value.uri.path !=
-                Destinations.search) {
+            _remoteRoutePath != Destinations.search) {
           search.close();
         }
         if (search != null && search.active) {
+          _wakeRemoteScreen();
           search.receive(message.arguments);
         } else if (message.arguments['MoonfinInputId'] == null) {
           // Another controller's text has no Search to land in yet, so it
@@ -1054,26 +1133,30 @@ class SessionRepository {
     PlaybackManager manager,
     RemoteSearchSession search,
   ) async {
+    _remoteNavigationGeneration++;
     _remoteSearch?.close();
     _remoteSearch = search;
+    _wakeRemoteScreen();
     try {
       CustomTVTextField.closeTopKeyboard();
-      appRouter.routerDelegate.navigatorKey.currentState?.popUntil(
+      _router.routerDelegate.navigatorKey.currentState?.popUntil(
         (route) => route is PageRoute,
       );
+      if (OverlaySheetController.hasOpenSheet) {
+        await OverlaySheetController.closeAllSheets();
+      }
+      if (!search.active) return;
       await manager.stop(userInitiated: false);
       if (!search.active) return;
       // Native tvOS playback is presented above Flutter's routes.
       final backend = manager.backend;
       if (backend is AppleTvBackend) await backend.dismissPlayer();
       if (!search.active) return;
-      final path = appRouter.routeInformationProvider.value.uri.path;
+      final path = _remoteRoutePath;
       if (path == Destinations.search || Destinations.isPlayerRoute(path)) {
-        unawaited(
-          appRouter.pushReplacement(Destinations.search, extra: search),
-        );
+        unawaited(_router.pushReplacement(Destinations.search, extra: search));
       } else {
-        unawaited(appRouter.push(Destinations.search, extra: search));
+        unawaited(_router.push(Destinations.search, extra: search));
       }
     } catch (_) {
       search.close();
@@ -1103,6 +1186,9 @@ class SessionRepository {
   }
 
   void dispose() {
+    _remoteVolumeGeneration++;
+    _remoteNavigationGeneration++;
+    _remoteKeys.releaseAll();
     _remoteSearch?.close();
     _remoteCommandSubscription?.cancel();
     _pluginEventSubscription?.cancel();
