@@ -100,6 +100,13 @@ void main() {
     when(() => client.imageApi).thenReturn(_ImageApi());
     when(() => client.baseUrl).thenReturn('http://test-server');
     when(() => client.serverType).thenReturn(ServerType.jellyfin);
+    when(
+      () => itemsApi.getEpisodes(
+        any(),
+        seasonId: any(named: 'seasonId'),
+        fields: any(named: 'fields'),
+      ),
+    ).thenAnswer((_) async => {'Items': <Map<String, dynamic>>[]});
     GetIt.instance.registerSingleton<RowDataSource>(RowDataSource(client));
     GetIt.instance.registerSingleton<MediaServerClient>(client);
   });
@@ -281,6 +288,41 @@ void main() {
       );
       await tester.pumpWidget(const SizedBox.shrink());
     }
+  });
+
+  testWidgets('episode errors finish safely without retrying on rebuild', (
+    tester,
+  ) async {
+    final failure = StateError('Episode request failed');
+    when(
+      () => itemsApi.getEpisodes(
+        any(),
+        seasonId: any(named: 'seasonId'),
+        fields: any(named: 'fields'),
+      ),
+    ).thenAnswer((_) async => throw failure);
+    final vm = viewModel('Series');
+
+    await pumpContent(tester, vm);
+    expect(tester.takeException(), isNull);
+    expect(vm.seriesEpisodesError, same(failure));
+    expect(
+      find.byKey(const ValueKey('nouveau-section-episodes')),
+      findsOneWidget,
+    );
+
+    await pumpContent(tester, vm);
+    await vm.loadAllSeriesEpisodes(caller: 'test');
+    expect(tester.takeException(), isNull);
+    verify(
+      () => itemsApi.getEpisodes(
+        'item-1',
+        seasonId: any(named: 'seasonId'),
+        fields: any(named: 'fields'),
+      ),
+    ).called(1);
+    await tester.pumpWidget(const SizedBox.shrink());
+    vm.dispose();
   });
 
   // Movie and Episode are the types that actually carry chapters, and every
