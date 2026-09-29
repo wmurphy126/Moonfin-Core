@@ -125,7 +125,7 @@ void main() {
     when(() => vm.episodes).thenReturn(const []);
     when(() => vm.seriesEpisodes).thenReturn(const []);
     when(() => vm.seriesEpisodesLoaded).thenReturn(true);
-    when(() => vm.loadAllSeriesEpisodes()).thenAnswer((_) async {});
+    when(() => vm.loadAllSeriesEpisodes(caller: any(named: 'caller'))).thenAnswer((_) async {});
     when(() => vm.nextUp).thenReturn(null);
     when(() => vm.tracks).thenReturn(const []);
     when(() => vm.albums).thenReturn(const []);

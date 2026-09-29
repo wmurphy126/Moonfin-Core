@@ -15,6 +15,10 @@ on:
         description: Build only a mobile test APK that installs alongside the normal app
         type: boolean
         default: false
+      tests:
+        description: Run analyzer and Dart tests (can run without platform builds)
+        type: boolean
+        default: false
       ios:
         description: Run iOS job
         type: boolean
@@ -761,7 +765,7 @@ jobs:
   # nothing imports and a failing test are invisible to them. This job is
   # what the PR comment reads its Tests line from.
   tests:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_all || inputs.android }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_all || inputs.android || inputs.tests }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
