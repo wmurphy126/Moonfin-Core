@@ -26,6 +26,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
   PerformanceSink? _sink;
   Timer? _sampleTimer, _heartbeat, _limit;
   Future<void>? _write;
+  Future<void>? _stopping;
   bool _sampling = false, _foreground = true, _busy = false;
   bool _observersAttached = false;
   bool _storageFailed = false;
@@ -60,7 +61,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
   final Map<int, PerformanceSpan> _artworkSpans = {};
   final Set<int> _artworkReady = {}, _artworkPainted = {};
 
-  bool get busy => _busy;
+  bool get busy => _busy || _stopping != null;
   int get elapsedSeconds =>
       (_recording?.clock.elapsedMilliseconds ?? 0) ~/ 1000;
   int get markerCount => _recording?.markers ?? 0;
@@ -83,6 +84,7 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> start() async {
+    if (_stopping != null) await _stopping;
     if (recording || _busy) return;
     _busy = true;
     notifyListeners();
@@ -473,7 +475,18 @@ class PerformanceRecorder extends ChangeNotifier with WidgetsBindingObserver {
     if (identical(_write, task)) _write = null;
   }
 
-  Future<void> stop({String reason = 'user'}) async {
+  Future<void> stop({String reason = 'user'}) {
+    final pending = _stopping;
+    if (pending != null) return pending;
+    final task = _stop(reason);
+    _stopping = task;
+    return task.whenComplete(() {
+      if (identical(_stopping, task)) _stopping = null;
+      notifyListeners();
+    });
+  }
+
+  Future<void> _stop(String reason) async {
     if (!recording) {
       if (_write != null) await _write;
       return;

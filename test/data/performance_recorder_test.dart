@@ -321,6 +321,39 @@ void main() {
   });
 
   test(
+    'a new recording waits for native shutdown and final journal write',
+    () async {
+      await recorder.start();
+      final requested = Completer<void>();
+      final release = Completer<void>();
+      var blocked = false;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'configure' &&
+                call.arguments['enabled'] == false &&
+                !blocked) {
+              blocked = true;
+              requested.complete();
+              await release.future;
+            }
+            return call.method == 'sample'
+                ? <String, Object?>{'pssKiB': 100}
+                : null;
+          });
+      final stopping = recorder.stop();
+      await requested.future;
+      final starting = recorder.start();
+      expect(recorder.recording, isFalse);
+      release.complete();
+      await Future.wait([stopping, starting]);
+      expect(recorder.recording, isTrue);
+      final rows = events((await recorder.report())!);
+      expect(rows.where((e) => e['event'] == 'recording.start'), hasLength(1));
+      expect(rows.where((e) => e['event'] == 'recording.stop'), hasLength(1));
+    },
+  );
+
+  test(
     'journals survive restart and rotate only the three owned recordings',
     () async {
       for (var session = 1; session <= 4; session++) {
